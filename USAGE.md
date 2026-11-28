@@ -294,7 +294,7 @@ returns `{output, raw, _treg: {served_by, tried, charged_micro}}` plus `X-Treg-S
 vendor 4xx is your request's fault and stops. A **miss** tries the next provider too (the waterfall,
 on by default), cheapest first, within `X-Treg-Route-Max-Cost` (default $1 per call); every
 attempt settles at its real price and misses on per-success providers are free. `X-Treg-Route-Waterfall: 0`
-stops at the first miss. `X-Treg-Route-Prefer` / `X-Treg-Route-Exclude` name providers. A filter the serving provider could not apply is named in `X-Treg-Ignored-Filters` (and `_treg.ignored_filters`); `X-Treg-Route-Strict-Filters: 1` refuses such a call with a 422 (unbilled) instead. When you sent a `domain` and the hit has an email, `X-Treg-Domain-Match` / `_treg.domain_match` says whether the mailbox domain matches — a LinkedIn-only provider often returns a former employer; the hit is still billed and the address is not altered. Vendor endpoints are still relayed verbatim; only `treg.*` rows model an API.
+stops at the first miss. `X-Treg-Route-Prefer` / `X-Treg-Route-Exclude` name providers. A filter the serving provider could not apply is named in `X-Treg-Ignored-Filters` (and `_treg.ignored_filters`); `X-Treg-Route-Strict-Filters: 1` refuses such a call with a 422 (unbilled) instead, and on people, job and `site:` searches leaves out of `output` the rows whose own place, company domain, posting date or link clearly breaks a sent filter (`_treg.strict_filtered` counts them, `raw` keeps them, the provider is billed as usual; a row naming only a larger place than asked is kept, unchecked). An answer left with no row asks at most 2 more providers, each billed as usual; `X-Treg-Route-Max-Cost` caps the total. When you sent a `domain` and the hit has an email, `X-Treg-Domain-Match` / `_treg.domain_match` says whether the mailbox domain matches — a LinkedIn-only provider often returns a former employer; the hit is still billed and the address is not altered. Vendor endpoints are still relayed verbatim; only `treg.*` rows model an API.
 
 `X-Treg-Route-Verify: true` on `treg.people.email.find` checks a hit with `treg.people.email.verify`
 in the same call: your own verifier key first, then BounceBan, then the usual order. The check is
@@ -313,6 +313,13 @@ Fewer wrong addresses get through, at a higher price and a slower answer. It nee
 with `X-Treg-Route-Waterfall: 0`, or on a routed tool without a confirm field, the header is
 refused (422, unbilled). Agreement is not delivery: combine it with `X-Treg-Route-Verify` to also
 check the mailbox.
+
+`X-Treg-Route-Ad-Hashes: true` on `treg.people.email.find` adds the hit's email as the hashes ad
+platforms match customer lists on: `_treg.ad_hashes: {hashed: true, linkedin, meta, google}`, each
+the SHA-256 of the address as that platform normalizes it (lowercase, no spaces; for Google, a
+gmail.com or googlemail.com address also loses its dots and `+tag`). treg computes them, so there
+is no extra charge, and `output` is not altered. A miss says `{hashed: false, reason: no_hit}`. On
+another routed tool the header is refused (422, unbilled).
 
 `X-Treg-Route-Domain-Match: strict` on `treg.people.email.find` keeps looking past a hit at another
 mail domain than the `domain` you sent: that hit is `weak`, and the waterfall goes on, each attempt

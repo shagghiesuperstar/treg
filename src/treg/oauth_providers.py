@@ -3251,8 +3251,8 @@ CLORO = OAuthProvider(
         "Create a key and copy it — the full key is shown only once.",
     ),
     setup_note=(
-        "Every monitor call spends credits from your cloro balance (Google 5, Google AI Mode / "
-        "Bing AI Mode / Gemini 6, "
+        "Every monitor call spends credits from your cloro balance (Google Search / Bing Search 5, "
+        "Google AI Mode / Bing AI Mode / Gemini 6, "
         "ChatGPT 7, each including the +2 sync surcharge; optional "
         "include flags and US state targeting add more). The free plan grants 500 credits a "
         "month. Connecting spends nothing — the probe is the free credit-balance route."
@@ -3264,7 +3264,7 @@ CLORO = OAuthProvider(
     summary=(
         "Ask ChatGPT, Gemini, Google AI Mode and Bing AI Mode a prompt from supported countries and "
         "read the answer and its cited sources as structured data — plus "
-        "Google Search and Google News SERPs."
+        "Google Search, Google News and Bing Search SERPs."
     ),
     base_url="https://api.cloro.dev",
     docs_url="https://cloro.dev/docs/api-reference/introduction",
@@ -3701,6 +3701,27 @@ DESCOVO = OAuthProvider(
     # Free: 200 {"data": {"available", "used", "limit", "resetsOn"}} for a good key; 403
     # {"error": {"code": "forbidden"}} for a bad one.
     probe_path="/credits",
+)
+
+
+UPCELL = OAuthProvider(
+    service="upcell", display_name="Upcell", auth_kind="key",
+    token_label="API key", token_placeholder="your Upcell API key",
+    token_header="Authorization", token_format="{secret}",
+    setup_url="https://upcell.io",
+    setup_action_label="Ask Upcell for an API key",
+    setup_steps=("Contact Upcell; API keys are issued by their team, not self-serve.",
+                 "Copy the key they send you."),
+    setup_note=(
+        "A mobile number found is charged; a lookup with no number and the usage check are free."
+    ),
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Find a person's mobile number from LinkedIn, an email, or their name and company.",
+    base_url="https://app.upcell.io",
+    docs_url="https://api.upcell.io/docs/dataenrichment/data-enrichment-api",
+    # Free: 200 {"valid": true, ...} for a good key; 401 {"error": "Invalid API key"} for a bad one.
+    probe_path="/validate-api-key", probe_method="POST",
 )
 
 
@@ -4652,7 +4673,7 @@ REGISTRY: dict[str, OAuthProvider] = {
         SCRAPEGRAPHAI, SERPER, BRAVESEARCH, LITESCRAPE, CLORO, LOCALFALCON,
         # more Enrichment API-key providers
         LUSHA, CORESIGNAL, DIFFBOT, THECOMPANIESAPI, LEADMAGIC, ENRICHLAYER, FIBER_AI, CRUSTDATA, THEIRSTACK, JOBSPIPE, AVIATO,
-        COMPANYENRICH, FUNDABLE, CORPOAPI, OCEANIO, ADYNTEL, TOMBA, TRESTLEIQ, HLRLOOKUP, FORAGER, PREDICTLEADS, FINDYMAIL, MILLIONPHONES, DESCOVO, ANYMAILFINDER, ENROW, FILTRAT, FILTRAT_FINDER, DROPCONTACT, BRANDDEV, ICYPEAS, LEADSFORGE, MAPSDATA,
+        COMPANYENRICH, FUNDABLE, CORPOAPI, OCEANIO, ADYNTEL, TOMBA, TRESTLEIQ, HLRLOOKUP, FORAGER, PREDICTLEADS, FINDYMAIL, MILLIONPHONES, DESCOVO, UPCELL, ANYMAILFINDER, ENROW, FILTRAT, FILTRAT_FINDER, DROPCONTACT, BRANDDEV, ICYPEAS, LEADSFORGE, MAPSDATA,
         INFLUENCERSCLUB, VILLAGE,
         # Places: intent-scored local search
         ATLY,

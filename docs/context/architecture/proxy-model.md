@@ -3,6 +3,8 @@ title: The proxy - faithful credential-injecting relay + tool resolution
 status: shipped
 sources:
   - src/treg/infra/upstream/relay.py
+  - src/treg/infra/own_key_credit.py
+  - tests/test_own_key_credit.py
   - src/treg/infra/upstream/pathsegment.py
   - src/treg/jsontext.py
   - src/treg/infra/upstream/ssrf.py
@@ -25,7 +27,6 @@ sources:
   - tests/test_platform_accounts.py
   - src/treg/client_identity.py
   - src/treg/call_surface.py
-  - src/treg/sandbox_identity.py
   - src/treg/domain/governance/access.py
   - src/treg/domain/governance/publicdemo.py
   - src/treg/domain/governance/usage.py
@@ -33,6 +34,7 @@ sources:
   - src/treg/application/hub/limits.py
   - tests/test_ssrf_public_addresses.py
   - tests/test_call_application_contract.py
+  - tests/test_caller_response_redaction.py
   - tests/test_call_cancellation.py
   - tests/test_call_response_limits.py
   - tests/test_error_capture.py
@@ -42,6 +44,7 @@ sources:
   - tests/test_tag_billing.py
   - tests/test_tag_billing_adversarial.py
   - tests/test_call_architecture.py
+  - tests/test_deny_rules.py
   - tests/test_asynctasks.py
   - tests/test_relay_content_length.py
 related:
@@ -104,8 +107,13 @@ Inside `relay()`:
    Try-it would otherwise leak the session.
 3. **`Accept-Encoding`** becomes `identity` when the caller sent none (the body is relayed raw with
    `aiter_raw`, and httpx would otherwise add its own `gzip`). With `force_identity` it is
-   overridden to `identity` wherever the application will read the body: metered settlement, an
-   owned free poll, and an archivable own-key answer.
+   overridden to `identity` wherever the application will parse the body: metered settlement, an
+   owned free poll and an archivable own-key answer. An own-key call to a catalog row marked
+   `echoes_credential` that the archive does not record ([below](#answers-that-quote-a-credential))
+   keeps the caller's codings save the ones the search cannot decode
+   (`relay.readable_encodings_only` with `evidence.READABLE_ENCODINGS`: gzip and deflate;
+   `identity` when nothing is left), so a clean answer keeps its compression. Every other request
+   carries the caller's value as sent.
 4. **Query pairs consumed into catalog path placeholders** (`drop_params`) are not also sent as
    query.
 5. **The injected credential(s).** Each binding overwrites only its target header, query parameter
@@ -194,7 +202,8 @@ only: the admin-log pattern nets would rewrite ordinary fields like `"key": "uni
 normalized re-check that still finds a credential, a credential that cannot be rendered, or a body
 that cannot be decoded replaces the whole body with a `response_redacted` error. An unchanged body
 keeps its bytes and encoding; a masked one is re-sent identity-encoded with a fresh
-`Content-Length`. 2xx bodies are untouched, save the one member below.
+`Content-Length`. Answers of a row marked `echoes_credential` get the same exact masking where
+they are held whole (next section); nothing else in a 2xx changes, save the one member below.
 
 A failed unmetered response is read whole (`_read_whole_if_small`, up to 8 MiB) so masking sees
 every byte; one too large is replaced on a credentialed call and streamed untouched
@@ -202,6 +211,83 @@ every byte; one too large is replaced on a credentialed call and streamed untouc
 bodies on unmetered paths are kept for evidence only when `Content-Length` is declared and within
 `evidence._ERROR_CALLER_BODY_MAX`; larger or chunked uploads keep streaming. Redaction order,
 access and retention: [data-model](data-model.md#audit-writer-auditpy).
+
+### Answers that quote a credential
+
+A provider can echo the injected credential in a successful answer too: Meta's Graph API writes
+the request's `access_token` into `paging.next` and `paging.previous`. A catalog row says so with
+`echoes_credential: true` ([catalog schema](catalog-schema.md#a-row-whose-answers-quote-the-credential));
+Meta's Graph files (`facebook`, `instagram`, `meta-ads`, `meta-ad-library`) set it in their
+provider `defaults:`. Only such a row's answers are held and searched: `_execute_call` reads the
+flag once per call (`echoes`) and gives every other row an empty `evidence.AnswerMask`, so its
+answer is relayed as before, nothing held, searched or re-encoded for it, its first byte never
+waiting for the last. On a marked row the mask (`answer_mask`, built after the OAuth refresh)
+covers every answer (any status below 400) the application holds whole, before the caller, an
+idempotent replay, a task record or the archive sees it:
+
+- a metered answer and an owned free poll: `service._mask_answer` at the hand-off, after
+  settlement, capacity signals, classification and the audit row have read the provider's bytes
+  (a free poll's error body takes `_redact_error_body` at the same point, on every row). The
+  archive's copy of a metered answer is the same masked bytes: the mask remembers its last answer,
+  so the body is searched once per call;
+- an own-key catalog 2xx (tier `tool` or `credential`; `own_key_masked`). Where the archive reads
+  it to record it, that is the archive's read, as before: up to `archive_max_body_bytes`, asked
+  for identity. Where the archive does not (recording off, a licence or row kind it may not store,
+  a team's opt-out), the answer is held whatever its type, up to the larger of
+  `archive_max_body_bytes` and `_TASK_ANSWER_MAX` when it names a task: a Graph page is JSON its
+  client reads whole anyway, so holding it costs only the time to the last byte. The request keeps
+  the caller's gzip or deflate there (relay rule 3 above), and a clean held answer goes out as it
+  came, compressed bytes and `Content-Encoding` alike. The archive's own recording is gated
+  exactly as before and stores an own-key answer as received, which is safe because an answer
+  quoting the team's own credential is never recorded (`_echoes_own_credential`);
+- an archive hit, masked where it is materialized with the call's spellings and treg's own for
+  the provider (`answer_mask(..., provider=)`): a hit can be a public answer treg's key fetched,
+  served to an own-key caller, or a copy kept before the archive masked answers.
+
+What the archive keeps from treg's key is masked with treg's own credentials for the provider,
+every account's (`platform_answer_mask`): on a marked row the call path records the masked answer
+and terminal task evidence is stored masked (`asynctasks._finish_terminal`, whose settlement
+still reads the provider's bytes; any other row's is stored as received); off the call path the
+refresh worker masks every row's refreshed answer before it records (`archive._refresh_call`).
+Every reader that shows stored bytes masks them on the way out as well, on every row, which
+covers copies kept before this: `GET /calls/{id}/result` (`service.stored_answer_for_caller`,
+then the reported-charge strip for a metered row), the activity feed's task view
+(`asynctasks.views_for`), the review judge, whose answer goes to a model outside treg
+(`review_answers.as_delivered`, before its own reported-charge strip), and the staff archive
+panel (`admin_archive_body`). A caller that reads only a task's money (`route._async_cost` for a
+routed async child, the arena) passes `views_for(..., answers=False)`, which loads and masks no
+answer, so error bodies aside a row not marked costs the call path no rendering and no search.
+A reader that pages or cuts a stored answer must do so after this masking, never before. An
+idempotent replay stored before then is returned as stored until it expires.
+
+The search is bytes only, with no decode of the body and no regex over it. Each spelling is found
+through its probe (`_probe`): its longest run of the characters percent-encoding, JSON escaping
+and `\/` leave alone (the last of equal runs, so the password of `login:password`), or the whole
+spelling when no run reaches 8 characters. The spellings of one value share a probe, probes that
+contain a shorter probe are not searched (`_first_spellings`), and when no probe occurs no
+spelling can, so an answer without a credential costs one pass per probe and comes back as the
+same object; an answer quoting one is rewritten with the spellings whose probe it contains,
+longest first. There is no normalized re-check and no whole-body replacement: the answer is what
+the caller came for. For the same reason a spelling shorter than 8 characters or made of digits
+only (`_ANSWER_SPELLING_MIN`) is not used: the decoded half of a Basic credential can be a 4-digit
+login, and a numeric credential inside a JSON number would break the document, while the whole
+credential, `Basic <it>` and `login:password` are masked. A gzip/deflate answer is decoded
+(bounded) only to be searched, and a masked one is re-sent identity-encoded; one it cannot decode
+whole (a multi-member gzip, or one past 8 MiB decoded: both held first, as their headers allow),
+or whose credentials cannot be rendered, is relayed as it came, with the rendering warning logged
+in the second case.
+
+Not masked: any answer, error bodies aside, of a row not marked `echoes_credential` or of an own
+tool (no catalog row). So on a row not marked, an answer that quotes a credential reaches the
+caller as received, is stored as received on a call on treg's key and is served so on other
+teams' hits; marking the row is the remedy. On a marked row, because no one holds it whole: an
+own-key 1xx or 3xx answer, an own-key answer larger than the hold (it streams on, untouched and
+never cut, from the first byte past it) and a spooled answer; nor one the search cannot decode
+whole (br, zstd, a multi-member gzip, or one past 8 MiB decoded) or one whose credentials cannot
+be rendered. A marked row's free answer on treg's key never streams unread
+(`MarketplaceCall.streamable_free_result` is false there): it is read whole and masked like a
+metered one. Meta's Graph read rows are own-key catalog rows, so their pages are held and masked
+on every archive setting.
 
 A keyless agent-payments call is the one case where treg removes a non-`x-treg-` header the caller
 sent: its payment credential or wallet proof (`Authorization: Payment …`, `PAYMENT-SIGNATURE`,
@@ -223,7 +309,7 @@ separators, escapes, number spellings); an answer that is not one UTF-8 JSON doc
 selecting nothing or one ending in an index or a filter returns the bytes unchanged.
 
 `service._without_reported_charge` applies it at one place: in the metered hand-off after
-settlement, capacity signals, classification, the audit row, overflow and error masking, before
+settlement, capacity signals, classification, the audit row, overflow and credential masking, before
 the idempotent store and the task record (`POST /tasks/{call_id}` compares the answer the caller
 holds). A served archive hit and an overflow answer pass the same point; the archive recorded the
 provider's bytes earlier, so a repeat hit settles from the charge it carries. `X-Treg-Upstream-Failed`
@@ -386,20 +472,49 @@ permission tier). A rule with `project_id` fires only on that project's tools; h
 member and project are ANDed, each NULL-means-any. `_deny_match` is pure and mirrors
 `localrun.check_deny` (argv instead of URL).
 
+A method rule matches the method the request was sent with **and** every method the request asks
+its upstream to run instead (`access.method_overrides`), so an override can add a refusal and never
+remove one: a POST rule refuses a GET carrying one, and a GET rule still refuses that GET. The
+signals are ones real upstreams honour, names and values case-insensitive, a comma list read as
+several, each value as sent:
+
+- query `method`: Meta's Graph API runs `GET ?method=post` or `?method=delete` as that method;
+- query `_method`: Laravel, Symfony, Spring and Express apps (Rails reads `_method` only from a
+  POST form body: see the limit below);
+- headers `X-HTTP-Method-Override` (Google's APIs, most web frameworks), `X-Method-Override` (a
+  common variant) and `X-HTTP-Method` (OData), each also spelled with `_` for `-`, since Rack and
+  CGI servers fold both spellings into one key.
+
+A query value that names no rule's method (an RPC API's `method=photos.search`) refuses nothing.
+A value that does name one is refused even where the upstream means something else by it (a
+parameter that happens to be called `method`, such as a shipping method `method=post`).
+The refusal says which method the request asked for. Nothing relayed changes: the parameter and the
+header reach the upstream as sent. A `_method` field in a request body is not read here, because
+the body is read only after these gates (and only when small or metered); a team that denies a
+method on an upstream reading `_method` from POST bodies (Rails, Laravel) also denies POST there.
+
 ### Call-time SSRF guard
 
 Every call-time lookup goes through `ssrf.host_is_public_async`: the blocking resolver runs on a small
 dedicated pool (`ssrf_lookup_threads`), so a slow or dead name server never stops the event loop, and at
 most one lookup per host is in flight (later callers await the same answer). No verdict is kept after it
-lands, so each new call resolves again.
+lands, so each new call resolves again. A caller that has waited `ssrf_lookup_timeout_s` is refused
+(`ssrf_lookup_timeout` in the log) with `AddressLookupTimedOut`, kept apart from a confirmed non-public
+answer: the relay's `502` says the lookup timed out, and the health run marks a credential whose token
+endpoint lookup timed out `unknown`, never `invalid`, so no owner is told it died. A lookup still queued when its last caller stops
+waiting is dropped, so it never delays later lookups; one already running cannot be interrupted, finishes on
+its thread, and the next call after it starts a fresh one, so a refusal never outlasts the slow resolver.
 
 Just before `send`, `relay()` re-resolves the upstream host (`host_is_public`, gated by
 `proxy_ssrf_check`) and refuses with `502` if any address is non-public: a `base_url` public at
 registration can later resolve to `169.254.169.254` or localhost. The other server-side roads to a
 user-chosen address make the same check (`ssrf.url_host_is_public`, resolved off the event loop,
 same switch) just before sending: the health probe (`health._probe`), the owner webhook
-(`health._notify`), and the OAuth token endpoint on refresh (`HTTPXOAuthRefreshPort.exchange`) and
-code exchange (`HTTPXOAuthExchangePort.exchange_code`). Registration
+(`health._notify`), the OAuth token endpoint on refresh (`HTTPXOAuthRefreshPort.exchange`) and
+code exchange (`HTTPXOAuthExchangePort.exchange_code`). The MCP OAuth client-id metadata fetch
+(`mcp_oauth.fetch_client_id_metadata`) uses the same lookup but checks always, whatever
+`proxy_ssrf_check` says: its URL comes from any client on the internet. The blocking `host_is_public` is for sync callers only; an
+async path never calls it directly. Registration
 (`ssrf.safe_webhook_url`) strips a trailing dot (`localhost.`; for a tool's `base_url` only while
 `proxy_ssrf_check` is on, so a local registry can still name a loopback upstream) and normalizes numeric IP encodings
 (`2130706433`, `0x7f000001`, `127.1`) through `inet_aton` before the literal-IP block. Targets must be globally routable
@@ -494,13 +609,12 @@ name the label, never a credential, so reordering accounts or regenerating a key
    `platform_account_unavailable`, which the worker backs off on, so a worker that lost its
    environment never releases a task it could poll once restored. Objects on different accounts:
    409 `platform_account_split`.
-2. A call carrying `Idempotency-Key` uses the account the org-scoped key hashes to, so a retry
-   reaching the provider lands where it can be recognized. The idempotency claim cannot remember the
-   account: a failed call deletes its claim, and that is exactly the retry that reaches the
-   provider.
-3. Otherwise an account not out of capacity whose smoothing bucket would wait least, ties rotating.
-   Rules 1-2 run during resolution (`pinned`); rule 3 runs right before relay (`assign`) and takes
+2. Otherwise an account not out of capacity whose smoothing bucket would wait least, ties rotating;
+   an account the sweep read below its drain mark (`low`) is passed over while another is not.
+   Rule 1 runs during resolution (`pinned`); rule 2 runs right before relay (`assign`) and takes
    the bucket's token with no await between, so a burst that resolved together still spreads.
+   `Idempotency-Key` does not pin an account: few providers read the header, and a pin would hold
+   a retry on an account that has run dry. treg's own idempotency table answers the retry.
 
 A non-primary call carries `account: <provider>/<label>` on its platform binding; the relay injects
 that account's values or fails `injection_failed`, never substituting another account. The primary
@@ -509,20 +623,26 @@ carries no `account` and uses the provider's own bucket, so a one-account provid
 Capacity is per account: a signature strikes and locks only the account that answered
 (`marks.lock_key(..., slot)`, `<key>#<label>` for non-primary), a 2xx clears only its own strikes,
 and a probe goes to the locked account. A call is refused before reserve only when its pinned
-account, or every account of an open call, is out. The sweep reads only the primary, so another
-account's lock lifts at expiry or through its own probe.
+account, or every account of an open call, is out. The sweep reads every account, so one read
+empty gets no calls while another can serve, and the next sweep that reads it refilled returns it
+to rotation ([capacity](../ops/capacity.md)).
 
 ## Platform capacity: refuse before reserve
 
-Platform-tier request guards (`_enforce_platform_request`, catalog `platform_request`) run after a
+Platform-tier request guards (`_enforce_platform_request`, catalog `platform_request`, and a row's
+`platform_check` plugin, `_enforce_platform_check`) run after a
 platform offer is selected and before reserve. They bound treg's exposure on its shared accounts:
 explicit bounded record counts, exact pricing selectors (a singleton-enum body field that picks a
 table price row must equal its value, or be absent when its declared default is that value, as the
 table prices an absent field; duplicate JSON keys are rejected so validation and upstream
 cannot disagree), the path values a row prices (a `pathParams` pin lists the models treg's key may
-run), and outright refusal of options whose charge or result arrives later at a
-caller's webhook, outside settlement's reads. Own keys are unaffected: the provider, not treg,
-bears that account's exposure.
+run), outright refusal of options whose charge or result arrives later at a
+caller's webhook, outside settlement's reads, and refusal of a credential the caller could send
+in a second place the provider reads (Apify's run rows take only their run options, through their
+`platform_check`, and its run polls only their declared query options, `platform_query: declared`;
+elsewhere a `headers.*` null pin). Own keys are
+unaffected: the provider, not treg, bears that account's exposure. A routed child refused for a
+header is skipped for that provider only ([catalog](catalog.md), routed endpoints).
 
 Tier 4 spends treg's own vendor account, which can be empty. After `_platform_offer` says yes,
 `_resolve_marketplace_call` consults the in-process capacity view (`domain.capacity.view`, loaded
@@ -552,7 +672,8 @@ answered: `cf-mitigated`, an HTML block page, 1xxx problem-JSON) strikes nothing
 caller's request shape must not take the provider away from every team. An `unrecorded` signal (a
 4xx matching no row whose body still names credits/quota/balance) emits a `capacity` `unrecorded`
 event ([capacity](../ops/capacity.md)): the tripwire for a vendor dialect missing from the table.
-Tiers 1/2 never consult the view; an org's own key running dry is relayed unchanged.
+Tiers 1/2 never consult the view; an org's own key running dry is relayed unchanged (the one
+exception, off by default, is the next section).
 
 The call that meets the signature (a strike, a probe, a free route's own quota) is not relayed
 either. `service._execute_call` replaces a tier-4 (treg's shared key) answer whose signal is
@@ -563,6 +684,44 @@ own error code or a 401 that reads as the caller's key never reaches the caller.
 `Retry-After` (the seconds until `resets_at` when known, else `CAPACITY_RETRY_AFTER_S`), since many
 clients retry a 503 at once. The audit row, its error evidence and `tool_called` keep the vendor's status and body. A routed child's
 `provider_capacity` refusal is `skipped` ("treg's account is used up"), never an error.
+
+## An own key out of credit (off by default)
+
+A team whose own key is out of credit, and whose agent keeps calling, sends treg a steady stream of
+calls the provider answers the same way every time. With `own_key_credit_hold_s`
+(`TREG_OWN_KEY_CREDIT_HOLD_S`, seconds, 0 = off, 300 at most) set, treg answers such a stream
+itself for a short hold instead of sending it (`infra/own_key_credit.py`).
+
+- **What starts a hold.** After an own-key answer on tier `credential` or `tool` (not metered, not
+  an owned free poll, not a routed child), `service._own_key_credit_answer` reads the answer the
+  caller received (credential masked) with the capacity signature table; a `balance` signature
+  (every provider 402, plus the table's own rows) on any status but 401 is out of credit. A process
+  counts these per team, endpoint and injected secret ids; any other answer ends the count, and a
+  gap longer than `max(60 s, 2 x hold)` starts it again. At `own_key_credit_streak`
+  (`TREG_OWN_KEY_CREDIT_STREAK`, default 10) in a row, `own_key_credit.observe` writes one mark in
+  the shared store for the hold's length: the streak, the provider's status and the first 300
+  characters of the answer as the caller received it.
+- **What it answers.** At the start of the relay step (after the database phase ended and after
+  the archive lookup, so a free stored answer is still served; before fair share and before
+  anything is sent), `own_key_credit.read` looks for the mark, but only in a process that itself saw
+  that key answered out of credit lately: a team whose key works costs no store round trip. A
+  mark answers `402` with `X-Treg-Error: 1`, `Retry-After` (seconds left in the hold) and
+  `detail.error = own_key_out_of_credit`, naming the provider, the endpoint and
+  `provider_last_answer` (status, time and the quoted text). The row has `refused_by=own_credit`,
+  no `upstream_ms`, and the failure kind is the caller's provider account.
+- **How it ends.** The mark has a fixed lifetime and nothing renews it: a held call reaches no
+  provider, so it is never counted. After the hold the next call is sent; if the account is still
+  empty, that one answer writes the mark again in a process that found the key held (a failed
+  probe, whatever that process's own count); a success ends the count and disarms the key, and
+  in a process that saw the streak it also clears the mark (elsewhere the mark ends at its
+  lifetime, so after a top-up calls are held for at most one hold). The mark's write and clear
+  run in the background, so no answer waits on the store. Connecting
+  another key gives other secret ids, so its calls are never held. A store that is slow or down
+  reads as no mark.
+- **Why it keeps the relay faithful.** A held call is treg's own refusal, marked as treg's, before
+  any provider request, like the other refusals on this road; no answer the provider gave is
+  altered, and the answer quoted is the one the caller already received. The key is never routed,
+  overflowed or metered, and a routed child is never held, so routing walks as it always did.
 
 ## Burst smoothing on treg's own keys
 
@@ -688,7 +847,7 @@ archived under the submission's call id.
 
 `MarketplaceCall.streamable_free_result` marks platform fetch utilities with an explicit free price,
 zero estimate, a required fetch ownership rule and no submission, owned poll or produced-resource
-evidence. Their successful GETs bypass `_buffer_response` (ownership is still checked before relay)
+evidence, never on a row marked `echoes_credential`. Their successful GETs bypass `_buffer_response` (ownership is still checked before relay)
 and stream in full with headers (including Range) through the router's close-once lifecycle. Audit
 size is unknown, not zero; nothing is archived or kept for replay, and the claim is released.
 A free `kind: utility` row with no ownership rule or managed resource (a provider's reference

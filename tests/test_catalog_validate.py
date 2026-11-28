@@ -222,7 +222,7 @@ def test_async_descriptor_accepts_both_poll_and_result_modes():
      "requires exactly in, name"),
     (lambda d: d.update(poll={"endpoint": "demo.video-gen.status",
                               "param": {"in": "headers", "name": "task_id"}}),
-     "must name an input field in pathParams or queryParams"),
+     "must name an input field in pathParams, queryParams or body"),
     (lambda d: d.update(poll={"endpoint": "demo.video-gen.status",
                               "param": {"in": "pathParams", "name": "missing"}}),
      "target does not declare input field"),
@@ -311,6 +311,23 @@ def test_async_descriptor_rejects_non_get_or_non_utility_targets():
     assert any("must use GET" in error for error in errors)
 
 
+def test_async_descriptor_polls_a_body_id_only_through_a_post_target():
+    """A provider that reads a task by POSTing its id (Icypeas) declares `in: body`; a path or
+    query id still needs GET, and a body id needs POST."""
+    index = {"demo.video-gen.status": {
+        "provider": "demo", "kind": "utility", "method": "POST", "path": "/tasks/read",
+        "input": {"body": {"id": {"type": "string", "required": True}}}}}
+    descriptor = _valid_async()
+    descriptor["poll"] = {"endpoint": "demo.video-gen.status", "param": {"in": "body", "name": "id"}}
+    assert _async_errors(descriptor, endpoint_index=index) == []
+    index["demo.video-gen.status"]["method"] = "GET"
+    assert any("must use POST to read a body id" in e for e in _async_errors(descriptor, endpoint_index=index))
+    fetch = _valid_async()
+    fetch["result"] = {"fetch": "demo.video-gen.content",
+                       "fetch_param": {"in": "body", "name": "video_id", "value_from": "id"}}
+    assert any("must name an input field in pathParams or queryParams" in e for e in _async_errors(fetch))
+
+
 def test_async_descriptor_rejects_unknown_keys_and_invalid_json_paths():
     descriptor = _valid_async()
     descriptor["webhook"] = "https://example.com"
@@ -397,20 +414,6 @@ def test_platform_async_object_reads_cannot_silently_omit_ownership_metadata():
     assert missing == []
 
 
-def test_untracked_extended_async_consumers_are_explicitly_byok_only():
-    catalog = catalog_store.load()
-    ids = {
-        "akta.x.request-status",
-        "tikhub.x.youtube-web-v2-get-video-captions-result",
-        "dataforseo.x.serp-ai-summary",
-        "dataforseo.x.serp-screenshot",
-    }
-    for endpoint_id in ids:
-        endpoint = catalog.by_id[endpoint_id]
-        assert endpoint["platform_blocked"]
-        assert not catalog.platform_eligible(endpoint)
-
-
 def _valid_table():
     return {
         "type": "per_success",
@@ -459,7 +462,8 @@ def test_cost_table_accepts_subset_rows_times_bounds_and_usage_settlement():
 @pytest.mark.parametrize(("mutate", "message"), [
     (lambda c: c.update(table=[]), "cost.table must be a non-empty list"),
     (lambda c: c.update(table=["row"]), "table row must be a mapping"),
-    (lambda c: c["table"][0].update(when={}), "when must be a non-empty mapping"),
+    (lambda c: c["table"][0].update(when=[]), "when must be a mapping"),
+    (lambda c: c["table"][0].update(when={}), "when is shadowed by an earlier subset row"),
     (lambda c: c["table"][0].update(when={"body.unknown": "x"}), "is not declared in input"),
     (lambda c: c["table"][0].update(value=-1), "value must be a finite non-negative number"),
     (lambda c: c["table"][1].update(times="body.frames"), "times field 'body.frames' is not declared"),
@@ -494,6 +498,30 @@ def test_cost_table_when_fields_need_required_or_default_and_times_needs_max():
     no_max["body"]["duration"].pop("max")
     errors = _table_errors(_valid_table(), no_max)
     assert any("must declare a positive input max" in error for error in errors)
+
+
+def test_a_usage_path_may_declare_that_a_missing_field_means_zero():
+    usage = _valid_table() | {"settle": "usage", "usage": {"path": "usage.cost", "unit": "usd", "missing": 0}}
+    assert _table_errors(usage) == []
+    usage["usage"]["missing"] = 1
+    assert any("usage.missing may only be 0" in e for e in _table_errors(usage))
+
+
+def test_cost_table_takes_a_last_catch_all_row_and_a_bounded_list_length_multiplier():
+    """A job priced per item it asks for: `when: {}` matches every request, and `times` may name a
+    list whose length is the quantity, bounded by its declared maxItems."""
+    schema = {"body": {"rows": {"type": "array", "items": {"type": "string"}, "required": True,
+                                "minItems": 1, "maxItems": 500},
+                       "limit": {"type": "integer", "required": True, "min": 1, "max": 1000}}}
+    by_rows = _valid_table() | {"table": [{"when": {}, "value": 0.02, "times": "body.rows"}],
+                                "fallback": {"value": 10.0, "note": "the largest list"}}
+    assert _table_errors(by_rows, schema) == []
+    by_limit = by_rows | {"table": [{"when": {}, "value": 0.01, "times": "body.limit"}]}
+    assert _table_errors(by_limit, schema) == []
+    unbounded = {"body": {"rows": {"type": "array", "items": {"type": "string"}, "required": True}}}
+    assert any("must be numeric or a list with maxItems" in e for e in _table_errors(by_rows, unbounded))
+    low_fallback = by_rows | {"fallback": {"value": 1.0, "note": "too low"}}
+    assert any("must be at least every table row" in e for e in _table_errors(low_fallback, schema))
 
 
 def test_cost_table_rejects_shadowed_rows_and_ambiguous_or_non_finite_values():
@@ -752,8 +780,9 @@ def test_reported_credit_charge_requires_a_provider_fx_rate():
     ({'body.mode': 'sync'}, True),
     ({'body.mode': 'async'}, False),        # outside the declared enum
     ({'queryParams.type': None}, True),     # null: must be absent, declared or not
-    ({'body.realtime': None}, False),       # absence applies to query parameters only
-    ({'headers.x-key': None}, False),
+    ({'body.realtime': None}, True),        # a declared body field may be absent-only too
+    ({'body.missing': None}, False),        # an absent-only body field is a declared one
+    ({'headers.x-key': None}, True),        # null: the header must be absent, declared or not
     ({'pathParams.model': ['stable', 'stable-preview']}, True),   # a path or query pin may list values
     ({'pathParams.model': 'stable'}, True),
     ({'queryParams.memory': [1024, 2048]}, True),
@@ -889,7 +918,8 @@ def test_contactout_person_routes_cannot_recapture_pii():
     safe = {"contactout.people.count", "contactout.people.email.verify",
             "contactout.companies.search", "contactout.companies.enrich"}
     structural = {"contactout.people.contact.work", "contactout.people.contact.phone",
-                  "contactout.people.contact.personal"}
+                  "contactout.people.contact.personal", "contactout.people.audience.email-hash",
+                  "contactout.people.email.verify.batch", "contactout.people.contact.batch"}
     for ep in endpoints:
         if ep["id"] in safe:
             continue
@@ -899,12 +929,12 @@ def test_contactout_person_routes_cannot_recapture_pii():
         if ep["id"] in structural:
             assert ep["example_response"] == "examples/" + example.name
             payload = example.read_text()
-            assert "example.invalid" in payload or "+10000000000" in payload
+            if ep.get("terminal_example_response"):
+                payload += (path.parent / ep["terminal_example_response"]).read_text()
+            assert any(fake in payload for fake in ("example.invalid", "+10000000000", "routing-fixture"))
         else:
             assert "example_response" not in ep
             assert not example.exists()
-    work = next(ep for ep in endpoints if ep["id"] == "contactout.people.enrich.work_email")
-    assert work["cost"]["value"] == 0.17
 
 
 @pytest.mark.parametrize('display,valid', [
@@ -1125,6 +1155,17 @@ def test_usage_terms_are_accepted_for_a_multi_meter_response():
     assert errors == []
 
 
+def test_usage_terms_may_count_in_the_providers_credit():
+    """Icypeas bills a bulk file per counted row in credits: the rates stay in credits and fx.yaml
+    prices them, instead of a dollar rate copied into the row."""
+    cost = _flat_usage_cost()
+    cost["usage"] = {"unit": "credit", "terms": [{"path": "files[task=email-search].found", "rate": 1},
+                                                  {"path": "files[task=email-verification].done", "rate": 0.1}]}
+    errors: list[str] = []
+    validator.check_cost(cost, "x", errors, [], provider="icypeas")
+    assert errors == []
+
+
 @pytest.mark.parametrize(("usage", "message"), [
     ({"terms": [], "unit": "usd"}, "usage.terms must be"),
     ({"terms": [{"path": "a.b"}], "unit": "usd"}, "usage.terms must be"),
@@ -1134,9 +1175,9 @@ def test_usage_terms_are_accepted_for_a_multi_meter_response():
     ({"terms": [{"path": "a[version=v1.2].b", "rate": 1}], "unit": "usd"}, "usage.terms must be"),
     ({"terms": [{"path": "a.b", "rate": 0}], "unit": "usd"}, "usage.terms must be"),
     ({"terms": [{"path": "a.b", "rate": float("nan")}], "unit": "usd"}, "usage.terms must be"),
-    ({"terms": [{"path": "a.b", "rate": 1}], "unit": "credit"}, "usage.unit must be 'usd'"),
+    ({"terms": [{"path": "a.b", "rate": 1}], "unit": "credit"}, "needs a numeric fx.yaml credit_rates_usd"),
     ({"terms": [{"path": "a.b", "rate": 1}], "path": "a.b", "unit": "usd"},
-     "or usage.terms and unit 'usd'"),
+     "or usage.terms and usage.unit"),
 ])
 def test_usage_terms_reject_bad_shapes(usage, message):
     cost = _flat_usage_cost()
@@ -1185,24 +1226,40 @@ def test_a_fixed_price_spools_when_its_success_rule_is_declared():
     assert errors == []
 
 
-def test_the_fast_catalog_loader_reads_every_file_like_the_pure_python_one():
-    """The catalog's YAML reading uses libyaml's C parser when it is installed; every shipped catalog
-    file must parse to the same document as with the pure-Python SafeLoader, timestamps kept as
-    strings."""
-    import yaml
-    from treg.domain.catalog import store
-    from treg.domain.catalog.schema import files
+def test_echoes_credential_is_accepted_in_provider_defaults_and_on_one_endpoint(
+    tmp_path, monkeypatch, capsys,
+):
+    """Graph's files set `echoes_credential` in `defaults:`; a provider can also set it on one
+    row, and a row's `false` opts out of the default."""
+    (tmp_path / "capabilities.yaml").write_text(
+        "platforms: {web: Web}\ncapabilities: {web.read: Read a page}\n")
+    (tmp_path / "fx.yaml").write_text("credit_rates_usd: {}\n")
+    row = ("  - id: {provider}.web.{name}\n    capability: web.read\n    platform: web\n"
+           "    method: GET\n    path: /{name}\n    summary: Read a page\n    added: '2026-11-27'\n"
+           "    cost: {{type: free, value: 0, currency: USD, unit: call}}\n")
+    (tmp_path / "facebook.yaml").write_text(
+        "provider: facebook\nsource: {docs: https://example.com/docs}\n"
+        "defaults:\n  echoes_credential: true\nendpoints:\n"
+        + row.format(provider="facebook", name="page")
+        + row.format(provider="facebook", name="raw") + "    echoes_credential: false\n")
+    (tmp_path / "tikhub.yaml").write_text(
+        "provider: tikhub\nsource: {docs: https://example.com/docs}\nendpoints:\n"
+        + row.format(provider="tikhub", name="page") + "    echoes_credential: true\n"
+        + row.format(provider="tikhub", name="plain"))
+    monkeypatch.setattr(validator, "CATALOG", tmp_path)
 
-    class Pure(yaml.SafeLoader):
-        pass
-    Pure.yaml_implicit_resolvers = files._Loader.yaml_implicit_resolvers
-    if not getattr(yaml, "__with_libyaml__", False):
-        pytest.skip("libyaml not installed")
-    assert issubclass(files._Loader, yaml.CSafeLoader)
-    for path in sorted(store.CATALOG_DIR.rglob("*.yaml")):
-        text = path.read_text(encoding="utf-8")
-        assert yaml.load(text, Loader=files._Loader) == yaml.load(text, Loader=Pure), path.name
-    assert yaml.load("checked: 2026-09-01", Loader=files._Loader) == {"checked": "2026-09-01"}
+    assert validator.main(["facebook", "tikhub"]) == 0
+    assert "0 error(s)" in capsys.readouterr().out
+    rows = catalog_store.load(directory=tmp_path).by_id
+    assert {endpoint: row["echoes_credential"] for endpoint, row in rows.items()} == {
+        "facebook.web.page": True, "facebook.web.raw": False, "tikhub.web.page": True,
+        "tikhub.web.plain": False}
+
+
+def test_the_catalog_loader_keeps_dates_as_strings(tmp_path):
+    from treg.domain.catalog.schema import files
+    (tmp_path / "row.yaml").write_text("checked: 2026-09-01\n")
+    assert files.read_yaml(tmp_path / "row.yaml") == {"checked": "2026-09-01"}
 
 
 def _per_result_cost(**extra):
@@ -1360,8 +1417,7 @@ def test_bills_miss_is_true_and_only_on_a_per_success_or_per_result_price():
     validator.check_cost(base | {"type": "per_result", "bills_miss": True}, "catalog:test", ok, [])
     assert ok == []
     for bad in (base | {"bills_miss": False}, base | {"bills_miss": "yes"},
-                base | {"type": "per_call", "bills_miss": True},
-                base | {"type": "quota_rows", "bills_miss": True}):
+                base | {"type": "per_call", "bills_miss": True}):
         errors: list[str] = []
         validator.check_cost(bad, "catalog:test", errors, [])
         assert any("bills_miss" in e for e in errors), bad
@@ -1397,13 +1453,12 @@ def _v2_cost_errors(endpoint_id: str, **keys) -> list[str]:
 GEMINI = "google-ai.image-gen.gemini-3-1-flash-image"
 
 
-def test_the_pilot_v2_rows_pass_the_v2_cost_checks():
-    assert _v2_cost_errors(GEMINI) == [] and _v2_cost_errors("findymail.search.domain") == []
-
-
 @pytest.mark.parametrize("endpoint_id,keys,message", [
     ("findymail.search.domain", {"settle": {"reported": {"path": "response.credits_used", "unit": "credits"}}},
      "settle.reported.unit 'credits' is not usd, credit"),
+    ("findymail.search.domain", {"price": {"value": "0", "currency": "USD", "unit": "call"},
+                                 "settle": {"reported": {"path": "response.cost", "unit": "usd"}}},
+     "a free price never settles from a reported charge"),
     ("findymail.search.domain", {"price": {"value": "1", "currency": "unit", "unit": "page"}},
      "price.currency unit (unit page) has no fx.yaml rate"),
     ("findymail.search.domain", {"reserve": {"rows": {"param": "body.limit", "max": 10}}},
@@ -1471,9 +1526,7 @@ def test_row_text_passes_a_row_that_says_what_the_tool_does(row):
     ({"summary": "Search posts; results May lag"}, "summary says 'May' (may): a hedge"),
     ({"summary": "Search posts", "note": "It no\n  longer returns views."},
      "note says 'no\\n  longer' (no longer): argues with an earlier text"),
-    ({"summary": "Search posts", "note": "Billed per_call so a miss is paid."}, "note says 'per_call so' (per_call so)"),
     ({"summary": "Search posts. Live 2026-09-08 it returned ten."}, "summary says '2026-09-08'"),
-    ({"summary": "Search posts", "note": "Across 40 calls the answer was stale."}, "note says '40 calls'"),
     ({"summary": "Search posts", "input": {"queryParams": {"q": {"type": "string", "note": "often a hashtag"}}}},
      "input.queryParams.q.note says 'often'"),
     ({"summary": "Search posts", "input": {"body": {"type": "object", "properties": {

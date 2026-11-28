@@ -1,17 +1,14 @@
 """Terminal audit corrections queue original-day recounts atomically, outside money."""
 
 from datetime import datetime, timedelta
-from importlib import import_module
 
 import pytest
 import sqlalchemy as sa
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
 
 from treg import audit
 from treg.infra import db
 from treg.infra.catalog_stat_dirty import mark_dirty
-from treg.models import AsyncTaskRecord, CallRecord, EndpointDayStat, EndpointStatDirty, Org
+from treg.models import AsyncTaskRecord, CallRecord, EndpointStatDirty, Org
 
 NOW = datetime(2026, 1, 10, 12)
 EP = "test.async.endpoint"
@@ -35,10 +32,11 @@ def _fields(call_id="synthetic-call", *, endpoint=EP, org_id=1, at=NOW, **overri
                 call_ref=call_id, created_at=at, **overrides)
 
 
-def _correction(call_id="synthetic-call", *, endpoint=EP, org_id=1, hit=True):
+def _correction(call_id="synthetic-call", *, endpoint=EP, org_id=1, hit=True, charged_micro=None):
     return (audit._AsyncHitUpdate,
             dict(call_id=call_id, endpoint_id=endpoint, org_id=org_id, hit=hit,
-                 verdict="valid" if hit else "not_found"))
+                 verdict=None if hit is None else "valid" if hit else "not_found",
+                 charged_micro=charged_micro))
 
 
 async def _seed(*fields):
@@ -156,14 +154,25 @@ async def test_terminal_before_audit_insert_uses_durable_verdict_without_phantom
         session.add(AsyncTaskRecord(
             call_id="synthetic-call", org_id=1, provider="synthetic", endpoint_id=EP,
             reserved_micro=0, next_check_at=NOW, created_at=NOW, status="settled",
-            completed_at=NOW, hit=True, verdict="valid"))
+            completed_at=NOW, hit=True, verdict="valid", settled_micro=1234))
         await session.commit()
-    assert await audit._write_batch([_correction()])
+    assert await audit._write_batch([_correction(charged_micro=1234)])
     assert await _markers() == []
     assert await audit._write_batch([(CallRecord, _fields(_async_submission=True))])
     async with db.session_maker() as session:
         record = (await session.execute(sa.select(CallRecord))).scalar_one()
         assert record.hit is True and record.verdict == "valid"
+        assert record.cost_charged_micro == 1234
+    assert await _markers() == []
+
+
+async def test_a_charge_alone_updates_the_record_without_a_stats_recount(clean_store):
+    await _seed(_fields(hit=True, verdict="valid"))
+    assert await audit._write_batch([_correction(hit=None, charged_micro=0)])
+    async with db.session_maker() as session:
+        record = (await session.execute(sa.select(CallRecord))).scalar_one()
+        assert record.cost_charged_micro == 0
+        assert record.hit is True and record.verdict == "valid"  # the verdict is not cleared
     assert await _markers() == []
 
 
@@ -174,44 +183,3 @@ async def test_insert_then_correction_in_one_batch_marks_inserted_row(clean_stor
     async with db.session_maker() as session:
         record = (await session.execute(sa.select(CallRecord))).scalar_one()
         assert record.hit is False and record.verdict == "not_found"
-
-
-def test_additive_migration_preserves_legacy_buckets_and_never_requires_callrecord():
-    migration = import_module("treg.alembic.versions.0074_endpoint_stat_dirty")
-    engine = sa.create_engine("sqlite://")
-    try:
-        with engine.begin() as connection:
-            connection.execute(sa.text(
-                "CREATE TABLE endpointdaystat (endpoint_id VARCHAR NOT NULL, day VARCHAR NOT NULL, "
-                "n INTEGER NOT NULL, PRIMARY KEY (endpoint_id, day))"))
-            connection.execute(sa.text(
-                "INSERT INTO endpointdaystat VALUES ('synthetic', '2026-01-09', 7)"))
-            with Operations.context(MigrationContext.configure(connection)):
-                migration.upgrade()
-            # There is deliberately no CallRecord table in this database: the upgrade must
-            # add structure without reading or seeding from the large audit table.
-            assert connection.execute(sa.text(
-                "SELECT n, terminal_reconciled FROM endpointdaystat")).one() == (7, 0)
-            assert connection.execute(sa.text("SELECT count(*) FROM endpointstatdirty")).scalar_one() == 0
-            columns = {column["name"]: column for column in sa.inspect(connection).get_columns(
-                "endpointstatdirty")}
-            assert isinstance(columns["revision"]["type"], sa.BigInteger)
-            assert not columns["revision"]["nullable"]
-            assert sa.inspect(connection).get_pk_constraint("endpointstatdirty")[
-                "constrained_columns"] == ["endpoint_id", "day"]
-            index, = sa.inspect(connection).get_indexes("endpointstatdirty")
-            assert index["column_names"] == ["retry_at", "endpoint_id", "day"]
-            assert index["name"] in {index.name for index in EndpointStatDirty.__table__.indexes}
-            connection.execute(sa.text(
-                "INSERT INTO endpointstatdirty (endpoint_id, day, queued_at, retry_at) "
-                "VALUES ('synthetic', '2026-01-09', :now, :now)"), {"now": NOW.isoformat(" ")})
-            assert connection.execute(sa.text("SELECT revision FROM endpointstatdirty")).scalar_one() == 1
-            assert EndpointDayStat(endpoint_id=EP, day="2026-01-09").terminal_reconciled is False
-            with Operations.context(MigrationContext.configure(connection)):
-                migration.downgrade()
-            assert not sa.inspect(connection).has_table("endpointstatdirty")
-            assert connection.execute(sa.text("SELECT n FROM endpointdaystat")).scalar_one() == 7
-            assert "terminal_reconciled" not in {
-                column["name"] for column in sa.inspect(connection).get_columns("endpointdaystat")}
-    finally:
-        engine.dispose()

@@ -44,8 +44,9 @@ provider account and bypass this platform ownership table.
   archived results and shared-provider async ownership; foreign and untagged records return 404.
   These scopes do not partition a team's BYOK account or authenticate public media URLs.
 - **SSRF guard.** A tool's upstream host is re-resolved at call time and internal/metadata addresses are
-  refused (defeats DNS-rebinding). Health probes, owner webhooks and OAuth token requests are checked
-  the same way before they are sent.
+  refused (defeats DNS-rebinding). Health probes, owner webhooks, OAuth token requests and MCP client
+  metadata fetches are checked the same way before they are sent. A lookup that does not answer in time is
+  refused, never allowed.
 - **Local runs are sandboxed.** `treg run` on a member's machine executes the CLI as a locked-down
   `treg-run` user, with an egress allow-list and an optional filesystem jail, so a shared key can't be
   read, exfiltrated over the network, or written to a member-readable file.
@@ -96,10 +97,17 @@ follow-up HEAD. HEAD makes one request for object size. No custom digest metadat
 required. GET enforces the size limit and checks downloaded bytes against the object's SHA-256
 hash. The bucket is not public and no object URL is exposed: call-history authorization checks
 the team's CallRecord before resolving its archive reference. A hash is an identity, not an
-access credential. Upstream answers are retained under the existing archive policy. A provider
-that echoes treg's PLATFORM credential in a 2xx body is not sanitized by these guards (judge that
-provider's `cache` with it in mind); an answer that echoes a team's OWN credential is refused by
-the recorder (`_echoes_own_credential`). An own-credential answer is stored under a cache key that
+access credential. Upstream answers are retained under the existing archive policy. On a catalog
+row marked `echoes_credential`, an answer that echoes treg's PLATFORM credential is stored masked,
+as its caller receives it (`evidence.AnswerMask`: by the call path and for terminal task
+evidence), and the refresh worker masks every row's refreshed answer. On any other row a provider
+that echoes treg's PLATFORM credential in a 2xx body is not sanitized by these guards: the answer
+is relayed as received, stored as received on a call on treg's key, and served so on other teams'
+hits; mark the row `echoes_credential` (and judge that provider's `cache` with it in mind).
+`GET /calls/{id}/result`, Activity, the review judge (whose reads go to a model outside treg) and
+the staff archive panel mask treg's credentials in every stored copy they read; an answer that
+echoes a team's OWN credential is refused by the recorder (`_echoes_own_credential`) and the rest
+are stored as received. An own-credential answer is stored under a cache key that
 folds in the org (or the connection, on an `own_account` endpoint), so another team never computes
 the hash that would find it; only an endpoint-level `cache.sharing: public` declaration puts such an
 answer on the public key.

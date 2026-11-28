@@ -8,10 +8,12 @@ sources:
   - src/treg/domain/catalog/results.py
   - src/treg/domain/catalog/rankings.py
   - src/treg/domain/catalog/routing/__init__.py
+  - src/treg/domain/catalog/routing/ad_hashes.py
   - src/treg/domain/catalog/routing/contracts.py
   - src/treg/domain/catalog/routing/paths.py
   - src/treg/domain/catalog/routing/plan.py
   - src/treg/domain/catalog/routing/quality.py
+  - src/treg/domain/catalog/routing/row_filters.py
   - src/treg/domain/catalog/routing/health.py
   - src/treg/domain/catalog/routing/synthetic.py
   - src/treg/application/rankings.py
@@ -307,7 +309,7 @@ what follows about reading `cost` holds for it; how it bills is
 
 ```yaml
 cost:
-  type: per_result        # per_call | per_result | per_success | free | quota_rows
+  type: per_result        # per_call | per_result | per_success | free
   value: 2.00             # non-null unless confidence: unknown
   currency: USD           # USD | CNY | credit | unit
   per: 1000               # the quantity `value` covers (default 1)
@@ -333,9 +335,10 @@ Each `credit_rates_usd` / `unit_rates_usd` entry carries `usd` plus `basis`/`sou
 cheapest PUBLICLY listed tier, so the figure is an upper bound on real spend. `usd: null` is
 deliberate (no published per-credit price, or an own-key-only provider treg holds no rate for):
 those endpoints keep `cost.usd = null` and display natively, because a guessed dollar figure is
-worse than an honest credit count. A v2 price in credits or a meter needs an entry, a null one
-included; a missing entry fails validation. Both blocks must stay
-ABOVE `rates_to_usd:` - `catalog_fx_update.py` rewrites the file from the text before that key and
+worse than an honest credit count. An own-key call to such a row still prices (pricing runs on
+every tier): its per-unit and credit figures are an informational zero, while a platform-eligible
+row with no rate still refuses to price. A v2 price in credits or a meter needs an entry, a null
+one included; a missing entry fails validation. Both blocks must stay ABOVE `rates_to_usd:` - `catalog_fx_update.py` rewrites the file from the text before that key and
 discards everything below it.
 
 Two treg-set kinds exist for providers with no per-call vendor price; [money](money.md) owns the
@@ -371,8 +374,10 @@ cost:
   `queryParams.mode`) so query/body collisions cannot price the wrong field. Every `when` field must
   be required or have a `default`; narrow rows precede broad ones; the validator rejects shadowed or
   duplicate conditions, unknown keys, non-finite values, values outside the input's enum/min/max, and
-  `value` together with `table`.
-- `times` multiplies by one numeric field with a positive `max`. A value outside the declared range,
+  `value` together with `table`. An empty `when: {}` matches every request, so it can only be the
+  last row: a job priced by its size alone is one such row with `times`.
+- `times` multiplies by one numeric field with a positive `max`, or by the length of one list field
+  with a positive `maxItems` (one price per row a job asks for). A value outside the declared range,
   non-finite or non-positive (whatever minimum the field declares) matches no row and prices at the
   fallback, so a request can neither reserve zero nor bill past the ceiling. A sentinel such as
   `-1` is priced by a flat row that pins it, and that row is left out of the advertised rate span.
@@ -382,10 +387,13 @@ cost:
   `value` may also declare `settle: usage` with its `fallback` as the reserve. `worst_case`, the
   most one call can cost, raises the hold to cover that figure ([catalog schema](catalog-schema.md)). `usage.unit` is `usd`,
   `credit` (when fx.yaml prices that provider's credit) or a native meter with a
-  `unit_rates_usd[provider][unit]` entry. `usage.terms` (unit `usd`) sums several meters times
-  positive USD rates; a term path may select a list item by key
+  `unit_rates_usd[provider][unit]` entry. `usage.terms` sums several meters times positive rates in
+  `usage.unit` (USD, or the provider's credit or meter, priced by fx.yaml like a single path); a term path may select a list item by key
   (`candidatesTokensDetails[modality=IMAGE].tokenCount`); an absent meter counts as zero (proto3
-  JSON omits zeros) and a response with none settles at the reserve. Settlement itself is in
+  JSON omits zeros) and a response with none settles at the reserve. A single `usage.path` may add
+  `missing: 0` for a provider that leaves a zero meter out of its finished answer (LeadsForge's
+  `consumedCredits`): absent then settles at zero, while an unreadable value still settles at the
+  reserve. Settlement itself is in
   [money](money.md).
 - Display: `_table_floor` computes the cheapest row into `cost.table_min`, served as `usd_min`
   beside `usd` (still the ceiling reserve and eligibility read), so every surface shows `$low-$high`.
@@ -459,6 +467,11 @@ cost:
   (`resolve._spool_evidence_paths`), so evidence cannot drift from price. A fixed price needs an
   `expect` rule so a refused generation is not billed; the validator refuses the field beside
   `async`, `resource_ownership` or `managed_resource`, which need the whole body.
+- **`echoes_credential: true`**: the provider writes the credential treg injected into a successful
+  answer (Meta's Graph rows set it in their provider `defaults:`). Only such a row's answers are held
+  whole and masked on the call path; the loader serves `False` when absent
+  ([catalog schema](catalog-schema.md#a-row-whose-answers-quote-the-credential),
+  [proxy-model](proxy-model.md#answers-that-quote-a-credential)).
 - **`platform_request`** pins exact body, header, query or path values needed only on the shared
   credential. Each pin is a value its field declares, written as the declared type: a value only
   treg's key needs is pinned here and left out of the declaration, which every tier is held to. A
@@ -469,6 +482,17 @@ cost:
   is read as the pinned value's type, so a run option such as a spend cap can bound one call's cost.
   A `queryParams.*` pin of `null` means the parameter must be absent (it need not be declared), so a
   run mode the row does not price, such as a discovery switch, is refused on the shared credential.
+  A `body.*` pin of `null` does the same for a declared body field: an option the provider bills
+  outside the answer treg relays (a reveal delivered to the caller's webhook) is refused on the
+  shared credential, with the field named and its value never echoed. A `headers.*` pin of `null`
+  does the same for a header (it need not be declared): a second place the provider reads a
+  credential from, beside the one treg injects, is refused on the shared credential, so the
+  provider never answers for the caller's own account there.
+- **`platform_check`** names a plugin that checks the whole request on the shared credential when
+  pins cannot say the rule (a v2 row only; [catalog-schema](catalog-schema.md)).
+- **`platform_query: declared`** (a v2 row only): on the shared credential the query and path carry
+  only the names the row's `input` declares, so a parameter the provider also reads, in any spelling
+  its parser takes (Apify's `token`), never reaches it; a team's own key sends its query as given.
   Resolution applies these and the provider-specific request guards in `resolve` only after
   selecting the platform offer and before reserve; a team's own credential keeps the upstream
   contract.
@@ -611,9 +635,12 @@ Validation of the effective descriptor: dotted paths; non-empty `success`; `fail
 only when `billed_failure` supplies terminal failure words, or the descriptor has `max_age`; optional
 `progress` names expected non-terminal words; status lists are disjoint; positive `interval`; poll
 has exactly one of `endpoint` or `url_from`, result exactly one of `path` or `fetch`; unknown keys
-fail. Static poll/fetch ids must be same-provider GET utility endpoints; poll `param` is exactly
+fail. Static poll/fetch ids must be same-provider utility endpoints; poll `param` is exactly
 `{in, name}` and `fetch_param` exactly `{in, name, value_from}`, and the named input must exist on
-the target. Body-mode polling is outside the contract. Dynamic URLs need a non-empty `url_hosts`.
+the target. A path or query id needs a GET target. A poll `param` with `in: body` needs a POST
+target and is sent as the whole JSON body `{name: id}` (Icypeas reads a search that way) by the
+worker, the routed bridge, Enrich Arena, `/tasks/` and the CLI awaiter, whose resume line is then
+`treg call <poll> --data '{...}'`; a fetch id is never a body. Dynamic URLs need a non-empty `url_hosts`.
 An optional `pending_response` matches one non-2xx HTTP status and one JSON error value. The CLI
 and worker treat only that exact envelope as progress; other non-2xx responses remain errors and
 never serve as settlement evidence.
@@ -822,6 +849,12 @@ price when the deployment can relay it (`routers.catalog._overflow_disclosure`: 
 `overflow_price_unit`, `overflow_via`; MCP `catalog_get` lifts them) - the price a free endpoint can
 bill when treg's own account is out.
 
+Endpoint detail ranks siblings available on treg's key and approved hub tools together, followed by
+catalog siblings that require another credential. Within each group, the sort uses the Wilson
+reliability band, then lower p50 latency, lower advertised USD price, and ascending endpoint ID.
+Reviews are displayed separately from the ranking. The HTTP detail's `siblings_ranked` flag lets
+the CLI use that order while still sorting responses from older servers.
+
 ### Observations: folded off the request path, cached per process
 
 - `stats.EndpointObservationReader` is the domain port; bootstrap wraps
@@ -849,8 +882,7 @@ bill when treg's own account is out.
   writes; the worker owns transactions. Async endpoints with result adapters publish only when
   every applicable day is `terminal_reconciled` and no correction is older than `STALE_AFTER_S`;
   one untrustworthy day suppresses the endpoint's whole observation, because dropping the day would
-  bias its rate. Async hit rates use terminal evidence only. `catalog_stats.requeue_async_stats` and
-  `repair_status` are the explicit, manifest-driven requeue and its completion check.
+  bias its rate. Async hit rates use terminal evidence only.
 - Merging days weights each day's latency sample by the calls it stands for (`Tally.merge`), or the
   window's p95 would be the quiet days'. `stats.Tally` is the one shape for a day, a window and the
   live aggregate; `tests/test_catalog_stats_refresh.py` holds fold and SQL equal.
@@ -980,7 +1012,9 @@ headers are agent-facing in `src/treg/web/skill.md`; the invariants are AGENTS.m
 
 Per capability: one-of identity variants (structural keys, never provider names), `derive` rules,
 a small output core and `miss` in canonical terms. `raw` (the winning provider's body) is always
-returned and never documented as stable. An output field may say where it lands in a call event
+returned and never documented as stable. The parent's audit row records which child that body came
+from and its hash (`CallRecord.served_call_ref` / `served_content_hash`, set by `route._run_routed` before `_audit_parent`; `_run_upgrade`
+hands back the nested call's own), so the archived answer can be read later by exact id. An output field may say where it lands in a call event
 (`analytics`, [call-events](call-events.md)); the public contract view drops it.
 
 - `advice_unverified` is attached as `_treg.advice` to a hit whose `verified` is not true (a found
@@ -999,6 +1033,11 @@ returned and never documented as stable. An output field may say where it lands 
   international form is `not_international`, because HLR reads national digits as a country code),
   and its `skip_advice` replaces the find's advice. The header on a contract without `check` is a
   422 before planning.
+- `ad_hashes` (opt-in via `X-Treg-Route-Ad-Hashes`) names the output field holding an email. After
+  a hit, `route._ad_hashes` adds `_treg.ad_hashes`: `domain/catalog/routing/ad_hashes.hashes` gives
+  the SHA-256 of the address as LinkedIn, Meta and Google each normalize it. No call and no charge;
+  `output` is not altered; a miss or a hit without an address says `hashed: false` with `no_hit` or
+  `no_email`. The header on a contract without `ad_hashes` is a 422 before planning.
 - `confirm` (opt-in via `X-Treg-Route-Confirm`) names the field two DIFFERENT providers must agree on
   (trimmed, case-folded); two endpoints of one provider never confirm each other. The earlier hit is
   the answer; with no agreement before candidates or ceiling run out, the first hit returns marked
@@ -1159,7 +1198,11 @@ to a mapped word. `cost_units` gives an upper bound in catalog-priced units, use
 and the plan through `routing/plan.py::cost_at`. `max` (`{limit: 8}`) drops the child for a larger
 request (a number, or a string of ASCII digits) rather than letting it answer less than asked.
 `paging: {cursor: <body. or queryParams. path>}` (beside `out.next_cursor`) lets a routed answer
-continue on this child ([proxy-model](proxy-model.md) § Routed endpoints). A
+continue on this child ([proxy-model](proxy-model.md) § Routed endpoints). A routed adapter maps
+`out.next_cursor` only with `paging` naming a parameter of its provider row: without it the
+provider's own token reaches the caller and is refused when sent back
+(`test_every_routed_list_adapter_pages_through_a_treg_cursor` holds every routed list adapter to
+it). A
 routed call's own filter that a remaining v2 child maps into its `reserve.rows` count must be a
 whole number from 1 to that child's max: otherwise the routed call is refused (400
 `catalog_parameter_invalid`, naming its own parameter, never the child) when the route is planned,
@@ -1247,7 +1290,8 @@ an invalid extra never disables the primary.
     child's `tool_access_denied`, `policy_denied` or `capability_pinned` refusal, and a platform
     child's vendor 401/403 (treg's credential), fall back the same way. Balance and spend-cap
     refusals (`_GLOBAL_REFUSALS`) are terminal. treg's own team-level transient refusals
-    (`_TEAM_BUSY`: a busy money queue, an unreadable daily-cap or tag budget) are `skipped`, spend
+    (`_TEAM_BUSY`: a busy money queue, a throttled team (`team_backpressure`), an unreadable
+    daily-cap or tag budget) are `skipped`, spend
     no error allowance, and are tried on at most `MAX_TEAM_BUSY_TRIES` candidates; when only they
     stopped the call the caller gets treg's refusal with its `Retry-After`, never `route_failed`.
     Provider-level ones (`share_busy`, `provider_rate_limited`, `trial_allowance_unavailable`)
@@ -1256,6 +1300,9 @@ an invalid extra never disables the primary.
     is returned and the refused attempt is `skipped` with detail `refused by treg: <kind>`.
     A `call_admission` refusal of treg's money skips that candidate without
     spending the error allowance; every candidate refused answers that 403 for the routed endpoint.
+    A child inherits the parent's headers, so a header one provider refuses on treg's key (a
+    `platform_request` header pin, `route._platform_header_refusal`) skips that candidate the same
+    way; when every candidate was skipped so, the caller gets that header's 400.
   - Before planning, each identity field is read (`invalid_identity`, 422, even when another
     complete variant was sent): one of `format: url` must parse as an HTTP URL with a dotted host and
     no userinfo (a scheme-less one gets `https://`), and a stand-in key (`q`) must be a string. A
@@ -1365,6 +1412,52 @@ an invalid extra never disables the primary.
   `X-Treg-Route-Strict-Filters: 1` drops candidates that cannot express a sent filter
   (`strict: true` in `dropped`) and answers 422 `route_no_candidate`, unbilled, when none is left; a
   503 stays reserved for capacity/key drops.
+- **Strict filters judge rows too** (`row_filters`, `routing/row_filters.py`): a contract maps a
+  caller key to a test (`place`, `domain`, `site`, `within_days`) and the row path(s) it reads, the
+  first one present (a field of the contract's `row` when it has one; the loader refuses any other
+  key, test or field). Under the strict header `_strict_rows` judges each list row of a hit against
+  the filters the caller sent: a row whose field breaks one leaves `output`, a row that carries no
+  comparable field stays and counts as unchecked, and `_treg.strict_filtered` /
+  `X-Treg-Strict-Filtered` say `{removed, kept, by, unchecked, in_raw}` (summed over a merge).
+  `raw` is the child's body, whole, and `count` follows the kept rows only where it counted the
+  rows. The child settles at its own price: it answered. A hit left with no row is an attempt
+  `miss` and counts in `weak_hits` (one bound with the weak answers, later plain misses included:
+  at most `MAX_WEAK_FALLBACKS` more providers); when nothing better turns up, the first such answer
+  is returned as the miss with its rows in `raw` (`strict_emptied`). The filtered rows are what
+  `min_results`, fill and merge count. `place` reads a city, a US state (name or code) and a
+  country from both places. The same folded text always matches. Within the US a row is removed
+  only when it names another state or country, abroad only when it names another country; another
+  city is never judged, since plain text cannot tell it from a borough, a county, a metro area, an
+  address or another-language name (München, Köln). The asked city matches the row's city part
+  only. Abroad, a row is removed only when it names another country, or a US state, in full; a two-letter code never removes a row outside a US ask. In a row (`_read_row`) only a full name, or the names
+  `UK` and `US`, settles a state or a country; any other two-letter code ("Regina, SK", "Perth,
+  WA", "Munich, BY") stays a code, a US state only before "United States". A code removes a row
+  only for an ask in a US state, and only as a US state code other than the one asked ("Perth, WA"
+  for Texas); otherwise it can only confirm the place asked, and a code that is both a state and
+  a country confirms only a US ask. A country in another language ("Kanada") is not read. A lone
+  "Washington" in a row, or one followed by no state ("Washington, United States"), is the state
+  or the district ("Columbia District" names DC). A one-part row that names the asked
+  place's first part is a match ("Lebanon" for "Lebanon, PA"). A US territory (`pr`, `vi`, `gu`,
+  `as`, `mp`) is no other country than the US but is in no US state, and the two Congos are not
+  told apart (`_other_country`). A value naming several places (a list, or parts joined by `;` or `|`) is removed only
+  when every place is; the ask is read once per answer (`_asked`). The first part is a state only when
+  no later part names one, and "city" stays in a state reading ("Kansas City" is no state), so a
+  bare "Washington" is the state and "Washington, D.C." the district. A code that is both a state
+  and a country (`IN`, `CA`) in the ask is the state when a country follows it, else either, and
+  the name "Georgia" is always either. An ask that reads two ways ("Toronto, CA", "Mumbai, IN") is judged
+  under each reading and removes a row only when both do. In a row an either name never counts as
+  a match and removes the row only when neither reading is the place asked. A row naming only a
+  larger place than asked, a city asked with nothing around it ("Berlin" against "Toronto,
+  Canada"), or nothing comparable is unchecked. Noise words go first ("Greater … Area", "New York
+  City" is "New York").
+  `domain` takes the domain or a subdomain, the part after `@` of an address, a port and a
+  trailing dot aside; `site` reads `site:`
+  from `q` (`on_site`, as `no_result_on_site`) and judges nothing it cannot read (`site:.edu`,
+  `site:*.a.com`, a `/url?` redirect link, a percent-encoded address); `within_days` compares the
+  row's date as a UTC day. For a contract without a `row` the loader refuses a field no verified
+  adapter's example row carries (`row_filter_fields_unread`). Declared on
+  `people.search` (place, company domain), `companies.jobs.search` (place, posting date) and the
+  `site:` searches (`web.search`, `google.serp.organic`). A call without the header is unchanged.
 - **A filter applied only as a hint is named too**: an adapter's `soft:` list names caller keys its
   provider receives but does not enforce (exa and parallel people.search read the place and the
   company as words), and an endpoint parameter marked `applied: soft` makes every contract filter

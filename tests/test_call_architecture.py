@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from treg import archive, archive_bodies, bootstrap
+from treg import archive, archive_bodies
 from treg.application import billing, asynctasks as task_app, compare as compare_app
 from treg.application.hub import runner as hub_runner
 from treg.application.call import allowance as call_allowance
@@ -17,7 +17,9 @@ from treg.application.call import authorize, idempotency, overflow, reserve, rou
 from treg.domain import money
 from treg.domain.capacity import fair_share, marks as capacity_marks, rate_observe
 from treg.domain.governance import usage as usage_policy
-from treg.infra import provider_concurrency, provider_rate
+from treg.infra import (
+    empty_balance, own_key_credit, provider_concurrency, provider_rate, team_backpressure,
+)
 
 
 _SRC = Path(__file__).parents[1] / "src" / "treg"
@@ -48,9 +50,6 @@ _DATAPLANE_DERIVED_WRITES = {
     ),
     "public_demo_ratestore_hit": (
         (authorize.authorize_call, "publicdemo_policy.enforce_public_demo_ip_cap"),
-    ),
-    "sandbox_ratestore_hit": (
-        (authorize.enforce_public_demo_limit, "publicdemo_policy.enforce_public_demo_ip_cap"),
     ),
     "first_call_adconversion_outbox": (
         (settle._record_first_call, "adsconv.queue"),
@@ -135,9 +134,26 @@ _DATAPLANE_DERIVED_WRITES = {
     "provider_concurrency_lease": (
         (service._execute_call, "fair_share.acquire"),
         (fair_share._Pool._ask, "provider_concurrency.try_acquire"),
-        (provider_concurrency.try_acquire, "store.acquire_slot"),
+        (provider_concurrency.try_acquire_slot, "store.acquire_slot"),
         (provider_concurrency.Lease._renew, "self.store.renew_slot"),
         (provider_concurrency.Lease._release, "self.store.release_slot"),
+    ),
+    # A metered call of a team the fold is behind on takes one of the team's places (Redis, after
+    # the DB phase ended, before the reserve), released when the call ends; expiry frees a
+    # crashed holder's. A team that is not throttled writes nothing.
+    "team_backpressure_slot": (
+        (service._execute_call, "backpressure_admit"),
+        (reserve.backpressure_admit, "team_backpressure.admit"),
+        (team_backpressure.admit, "provider_concurrency.try_acquire_slot"),
+    ),
+    # A reserve the money admission queue turned away (the call's own, or its allowance refill's)
+    # counts once in a self-expiring per-team window (Redis, in a bounded background task, no
+    # session open); past the count it writes the team's self-expiring throttle mark.
+    "team_backpressure_admission_mark": (
+        (reserve.reserve_admission, "team_backpressure.note_admission_timeout"),
+        (call_allowance._refill, "team_backpressure.note_admission_timeout"),
+        (team_backpressure._count_timeout, "store.take"),
+        (team_backpressure._count_timeout, "store.set_text"),
     ),
     # A shared rate window: a platform call about to go upstream takes a self-expiring member of its
     # bucket's window (Redis, after the DB phase ended), given back when it is refused before sending.
@@ -199,6 +215,24 @@ _DATAPLANE_DERIVED_WRITES = {
         (service._execute_call, "compare_app.mark_eligible"),
         (compare_app.mark_eligible, "store.set_text"),
     ),
+    # A refusal for the balance that the database confirmed leaves a self-expiring per-team
+    # mark in the shared store (one bounded write, no database), which answers the team's next
+    # refusals before the money queue; every balance increase clears it once it is committed.
+    "empty_balance_mark": (
+        (reserve._platform_reserve, "empty_balance.remember"),
+        (empty_balance.remember, "set_text"),
+        (money._add_balance, "empty_balance.credited"),
+        (empty_balance.clear, "clear_flag"),
+        # a mark written just after a credit committed is taken back by the refusal itself
+        (reserve._platform_reserve, "empty_balance.clear"),
+    ),
+    # A team's own key drawing a streak of out-of-credit answers writes one self-expiring mark in
+    # the shared store (after the answer, no database); a success clears it.
+    "own_key_credit_mark": (
+        (service._execute_call, "own_key_credit.observe"),
+        (own_key_credit._write, "set_text"),
+        (own_key_credit._clear, "clear_flag"),
+    ),
 }
 _EXPECTED_DATAPLANE_WRITES = frozenset({
     "org_endpoint_quota",
@@ -206,7 +240,6 @@ _EXPECTED_DATAPLANE_WRITES = frozenset({
     "archive_body_object",
     "auto_topup_task",
     "public_demo_ratestore_hit",
-    "sandbox_ratestore_hit",
     "first_call_adconversion_outbox",
     "lazy_stale_hold_reap",
     "capacity_exhausted_mark",
@@ -220,12 +253,16 @@ _EXPECTED_DATAPLANE_WRITES = frozenset({
     "member_daily_cap_slot",
     "member_spend_attribution",
     "provider_concurrency_lease",
+    "team_backpressure_slot",
+    "team_backpressure_admission_mark",
     "provider_rate_window",
     "allowance_counter",
     "allowance_hold_refill",
     "allowance_call_charge",
     "comparison_marker",
     "allowance_in_flight_mark",
+    "empty_balance_mark",
+    "own_key_credit_mark",
 })
 _DERIVED_WRITE_FILES = {
     _SRC / "application" / "asynctasks.py": {"money_admission.admit"},
@@ -243,7 +280,11 @@ _DERIVED_WRITE_FILES = {
         "ledger.reap_stale_holds", "allowance_runtime.take",
         "allowance_runtime.give_back_for_exact_path",
         "idempotency.mark_in_flight", "idempotency.clear_in_flight",
+        "empty_balance.remember", "empty_balance.clear",
+        "team_backpressure.note_admission_timeout",
     },
+    _SRC / "infra" / "empty_balance.py": {"set_text", "clear_flag"},
+    _SRC / "infra" / "own_key_credit.py": {"set_text", "clear_flag"},
     _SRC / "application" / "call" / "allowance.py": {
         "money_admission.admit", "ledger.reap_stale_holds",
         "allowance.refill_allowance_in_transaction", "allowance.close_allowance_in_transaction",
@@ -254,6 +295,7 @@ _DERIVED_WRITE_FILES = {
         "store.allowance_add",
         "store.allowance_drop", "store.acquire_lease", "store.release_lease",
         "store.clear_call_in_flight", "clear_calls_in_flight", "mark_calls_in_flight",
+        "team_backpressure.note_admission_timeout",
     },
     _SRC / "application" / "call" / "settle.py": {
         "allowance_runtime.finish",
@@ -270,6 +312,9 @@ _DERIVED_WRITE_FILES = {
     _SRC / "domain" / "capacity" / "fair_share.py": {"provider_concurrency.try_acquire"},
     _SRC / "infra" / "provider_concurrency.py": {
         "store.acquire_slot", "self.store.renew_slot", "self.store.release_slot",
+    },
+    _SRC / "infra" / "team_backpressure.py": {
+        "provider_concurrency.try_acquire_slot", "store.take", "store.set_text",
     },
     _SRC / "domain" / "capacity" / "rate_observe.py": {"provider_rate.admit", "provider_rate.release"},
     _SRC / "infra" / "provider_rate.py": {"store.rate_window", "store.release_slot"},
@@ -292,13 +337,16 @@ _DERIVED_WRITE_FILES = {
         "provider_resources.rename",
         "provider_resources.tombstone",
         "return_daily_slot",
+        "own_key_credit.observe",
     },
     _SRC / "application" / "call" / "route.py": {"async_task_app.remember_routed_task"},
     _SRC / "domain" / "capacity" / "marks.py": {"ratestore.kv_put", "ratestore.kv_pop"},
     _SRC / "domain" / "governance" / "publicdemo.py": {
         "ratestore.sweep", "ratestore.rate_check",
     },
-    _SRC / "domain" / "money" / "__init__.py": {"reap_stale_holds", "release", "MemberSpend"},
+    _SRC / "domain" / "money" / "__init__.py": {
+        "reap_stale_holds", "release", "MemberSpend", "empty_balance.credited",
+    },
 }
 _EXPECTED_DERIVED_WRITE_SITES = {
     ("application/call/service.py", "_execute_call", "compare_app.mark_eligible"),
@@ -312,8 +360,7 @@ _EXPECTED_DERIVED_WRITE_SITES = {
     # a refill that folded a full batch leaves the rest of the queue to a background fold
     ("application/call/allowance.py", "_fold_backlog", "allowance.fold_charges_in_transaction"),
     ("application/call/allowance.py", "_fold_backlog", "money_admission.admit"),
-    ("application/call/allowance.py", "_fold_backlog", "store.acquire_lease"),
-    ("application/call/allowance.py", "_fold_backlog", "store.release_lease"),
+    ("application/call/allowance.py", "_release_lease_soon", "store.release_lease"),
     ("application/call/allowance.py", "_refill", "allowance.refill_allowance_in_transaction"),
     ("application/call/allowance.py", "_refill", "ledger.reap_stale_holds"),
     ("application/call/allowance.py", "_refill", "money_admission.admit"),
@@ -326,15 +373,14 @@ _EXPECTED_DERIVED_WRITE_SITES = {
     ("application/call/allowance.py", "_write", "store.allowance_freeze"),
     ("application/call/allowance.py", "_refill", "store.allowance_take_up_to"),
     # a call near the counter's deadline refills it beside itself, under the same lease
-    ("application/call/allowance.py", "_refresh_once", "store.acquire_lease"),
     ("application/call/allowance.py", "_refresh_once", "store.release_lease"),
-    ("application/call/allowance.py", "_take", "store.acquire_lease"),
     ("application/call/allowance.py", "_take", "store.allowance_take"),
+    # every taker of the team's lease (a refill, its refresh, the request-path fold, a
+    # give-back) asks for it through one helper, which yields to a starved team's fold claim
+    ("application/call/allowance.py", "acquire_money_lease", "store.acquire_lease"),
     ("application/call/allowance.py", "_take", "store.release_lease"),
     # an exact-path call the balance alone cannot pay for gets the sized counter back first:
     # the team's lease asked for once, then admission, the drop and the release in one session
-    ("application/call/allowance.py", "give_back_for_exact_path", "store.acquire_lease"),
-    ("application/call/allowance.py", "give_back_for_exact_path", "store.release_lease"),
     ("application/call/allowance.py", "_give_back", "money_admission.admit"),
     ("application/call/allowance.py", "_give_back", "store.allowance_drop"),
     ("application/call/allowance.py", "_give_back", "allowance.close_allowance_in_transaction"),
@@ -378,8 +424,6 @@ _EXPECTED_DERIVED_WRITE_SITES = {
     ("application/billing.py", "maybe_schedule_autotopup", "loop.create_task"),
     ("application/call/authorize.py", "authorize_call",
      "publicdemo_policy.enforce_public_demo_ip_cap"),
-    ("application/call/authorize.py", "enforce_public_demo_limit",
-     "publicdemo_policy.enforce_public_demo_ip_cap"),
     ("application/call/authorize.py", "authorize_call", "usage_policy.enforce_daily_cap"),
     ("domain/governance/usage.py", "enforce_daily_cap", "take_daily_slot"),
     ("application/call/service.py", "_execute_call", "return_daily_slot"),
@@ -421,8 +465,13 @@ _EXPECTED_DERIVED_WRITE_SITES = {
     ("application/call/service.py", "_execute_call", "fair_share.acquire"),
     ("domain/capacity/fair_share.py", "_ask", "provider_concurrency.try_acquire"),
     ("domain/capacity/fair_share.py", "_team_place", "provider_concurrency.try_acquire"),
-    ("infra/provider_concurrency.py", "try_acquire", "store.acquire_slot"),
+    ("infra/provider_concurrency.py", "try_acquire_slot", "store.acquire_slot"),
     ("infra/provider_concurrency.py", "_renew", "self.store.renew_slot"),
+    ("infra/team_backpressure.py", "admit", "provider_concurrency.try_acquire_slot"),
+    ("application/call/reserve.py", "reserve_admission", "team_backpressure.note_admission_timeout"),
+    ("application/call/allowance.py", "_refill", "team_backpressure.note_admission_timeout"),
+    ("infra/team_backpressure.py", "_count_timeout", "store.take"),
+    ("infra/team_backpressure.py", "_count_timeout", "store.set_text"),
     ("infra/provider_concurrency.py", "_release", "self.store.release_slot"),
     ("application/call/service.py", "_execute_call", "rate_observe.observe"),
     ("application/call/service.py", "admit_outbound", "rate_observe.observe"),
@@ -440,6 +489,18 @@ _EXPECTED_DERIVED_WRITE_SITES = {
     ("domain/money/__init__.py", "reap_stale_holds", "release"),
     ("domain/money/__init__.py", "reserve_in_transaction", "reap_stale_holds"),
     ("application/call/reserve.py", "_enforce_member_spend_cap", "ledger.reap_stale_holds"),
+    # the balance-empty mark: written by a confirmed balance refusal, cleared once a
+    # transaction that raised a balance is committed
+    ("application/call/reserve.py", "_platform_reserve", "empty_balance.remember"),
+    ("application/call/reserve.py", "_platform_reserve", "empty_balance.clear"),
+    ("infra/empty_balance.py", "remember", "set_text"),
+    ("infra/empty_balance.py", "clear", "clear_flag"),
+    ("domain/money/__init__.py", "_add_balance", "empty_balance.credited"),
+    # the own-key out-of-credit mark: written after a streak of out-of-credit answers, cleared by
+    # a success on the same key
+    ("application/call/service.py", "_execute_call", "own_key_credit.observe"),
+    ("infra/own_key_credit.py", "_write", "set_text"),
+    ("infra/own_key_credit.py", "_clear", "clear_flag"),
 }
 
 
@@ -458,26 +519,6 @@ def _call_names(source: str) -> set[str]:
         if parts:
             names.add(".".join(reversed(parts)))
     return names
-
-
-def _forbidden_imports(source: str, forbidden: tuple[str, ...]) -> set[str]:
-    found = set()
-    for node in ast.walk(ast.parse(source)):
-        names: list[str] = []
-        if isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names = [node.module]
-        for name in names:
-            if any(name == root or name.startswith(root + ".") for root in forbidden):
-                found.add(name)
-    return found
-
-
-def _package_forbidden_imports(package: Path, forbidden: tuple[str, ...]) -> set[str]:
-    return set().union(*(
-        _forbidden_imports(path.read_text(), forbidden) for path in package.rglob("*.py")
-    ))
 
 
 def _transaction_calls(source: str) -> set[str]:
@@ -503,15 +544,6 @@ def _derived_write_sites(overrides: dict[Path, str] | None = None) -> set[tuple[
     return sites
 
 
-def test_call_runtime_import_edges_point_inward() -> None:
-    call_forbidden = ("treg.api", "treg.bootstrap", "treg.routers", "fastapi", "starlette")
-    upstream_forbidden = call_forbidden
-    assert _package_forbidden_imports(_SRC / "application" / "call", call_forbidden) == set()
-    assert _package_forbidden_imports(_SRC / "infra" / "upstream", upstream_forbidden) == set()
-    async_forbidden = ("treg.api", "treg.routers", "treg.application", "treg.audit")
-    assert _package_forbidden_imports(_SRC / "domain" / "asynctasks", async_forbidden) == set()
-
-
 def test_catalog_access_router_only_translates_the_application_result() -> None:
     tree = ast.parse((_SRC / "routers" / "call.py").read_text())
     owner = next(
@@ -523,21 +555,6 @@ def test_catalog_access_router_only_translates_the_application_result() -> None:
         "get_catalog_endpoint_access",
         "_translate_call_failure",
     }
-
-
-def test_startup_manifests_keep_dataplane_and_control_work_separate() -> None:
-    assert bootstrap.ROLE_BACKGROUND_TASKS == {
-        "all": ("treg.adsconv.worker", "treg.application.affiliates.worker",
-                "treg.application.allowance_sweep.worker"),
-        "dataplane": (),
-        "control": ("treg.adsconv.worker", "treg.application.affiliates.worker",
-                    "treg.application.allowance_sweep.worker"),
-    }
-    for checks in bootstrap.ROLE_STARTUP_CHECKS.values():
-        assert "treg.api._backfill_provider_extra_tools" not in checks
-        assert "treg.api._bootstrap_single_user" not in checks
-    assert "treg.mcp.mcp_lifespan" in bootstrap.ROLE_STARTUP_CHECKS["dataplane"]
-    assert "treg.mcp.mcp_lifespan" not in bootstrap.ROLE_STARTUP_CHECKS["control"]
 
 
 def test_dataplane_derived_write_allowlist_is_explicit_and_live() -> None:

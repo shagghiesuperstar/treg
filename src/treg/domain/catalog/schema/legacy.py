@@ -64,6 +64,7 @@ class Usage(Model):
     unit: str
     path: str | None = None
     terms: list[UsageTerm] | None = None
+    missing: int | None = None  # 0: the provider omits a zero meter (LeadsForge `consumedCredits`)
 
 
 class ReportedCharge(Model):
@@ -98,7 +99,7 @@ class Modifier(Model):
 
 
 class Cost(Model):
-    type: Literal["per_call", "per_result", "per_success", "free", "quota_rows"] | None = None
+    type: Literal["per_call", "per_result", "per_success", "free"] | None = None
     value: Number | None = None
     currency: Literal["USD", "CNY", "credit", "unit"] | None = None
     per: int | None = None

@@ -192,6 +192,16 @@ def upper(v: Any) -> Any:
     return v.upper() if isinstance(v, str) else v
 
 
+def zero_based(position: Any) -> int | None:
+    """The zero-based offset of a result numbered from one."""
+    if isinstance(position, str) and position.isascii() and position.isdigit():
+        try:
+            position = int(position.lstrip("0") or "0")
+        except ValueError:
+            return None
+    return position - 1 if type(position) is int and position >= 1 else None
+
+
 def at_least(v: Any, floor: Any) -> Any:
     """A provider minimum (`pagination.size must not be less than 10`, lusha) applied to the
     caller's limit — the caller still pays the provider's price for the rows it insists on."""
@@ -597,7 +607,8 @@ def count_with(items: Any, path: Any) -> int | None:
 _SITE = re.compile(r"(?:^|[\s(])site:([^\s()]+)", re.I)
 
 
-def _host_path(url: str) -> tuple[str, str]:
+def host_path(url: str) -> tuple[str, str]:
+    """`https://www.a.com/Blog/` -> (`a.com`, `/blog`): a link's host and path, compared lower-cased."""
     from urllib.parse import urlsplit
     u = url.strip()
     parts = urlsplit(u if "//" in u else "//" + u)
@@ -605,15 +616,28 @@ def _host_path(url: str) -> tuple[str, str]:
     return host, parts.path.rstrip("/").lower()
 
 
+def site_restrictions(q: Any) -> list[tuple[str, str]]:
+    """The sites a question restricts results to (`site:stripe.com`, `site:a.com/blog`, several
+    joined by OR); a negated `-site:` is not a restriction."""
+    if not isinstance(q, str):
+        return []
+    return [(h, p) for h, p in (host_path(s) for s in _SITE.findall(q)) if h]
+
+
+def on_site(site: tuple[str, str], link: tuple[str, str]) -> bool:
+    """A link is on a site when its host is the site's or a subdomain of it, and a path in the
+    restriction prefixes the link's path."""
+    (sh, sp), (lh, lp) = site, link
+    return (lh == sh or lh.endswith("." + sh)) and (not sp or lp == sp or lp.startswith(sp + "/"))
+
+
 def no_result_on_site(q: Any, rows: Any) -> bool:
-    """True when the question restricts results to sites (`site:stripe.com`, `site:a.com/blog`, several
-    joined by OR) and not one row's link is on any of them: a subdomain counts, and a path in the
-    restriction must prefix the row's path. A question with no `site:` (a negated `-site:` is not a
-    restriction), no rows, or no row with a readable link is never judged."""
-    if not isinstance(q, str) or not isinstance(rows, list) or not rows:
+    """True when the question restricts results to sites (`site_restrictions`) and not one row's
+    link is on any of them (`on_site`). A question with no `site:`, no rows, or no row with a
+    readable link is never judged."""
+    if not isinstance(rows, list) or not rows:
         return False
-    sites = [_host_path(s) for s in _SITE.findall(q)]
-    sites = [(h, p) for h, p in sites if h]
+    sites = site_restrictions(q)
     if not sites:
         return False
     links = []
@@ -621,13 +645,10 @@ def no_result_on_site(q: Any, rows: Any) -> bool:
         if isinstance(row, dict):
             link = next((row[k] for k in ("url", "link", "href") if isinstance(row.get(k), str) and row[k]), None)
             if link:
-                links.append(_host_path(link))
+                links.append(host_path(link))
     if not links:
         return False
-    def on(site, link):
-        (sh, sp), (lh, lp) = site, link
-        return (lh == sh or lh.endswith("." + sh)) and (not sp or lp == sp or lp.startswith(sp + "/"))
-    return not any(on(s, ln) for s in sites for ln in links)
+    return not any(on_site(s, ln) for s in sites for ln in links)
 
 
 _QUOTED = re.compile(r'"([^"]{2,})"|\u201c([^\u201d]{2,})\u201d')
@@ -823,7 +844,8 @@ def starts_with(v: Any, prefix: Any) -> bool:
 TRANSFORMS = {"values": values, "get": get_path, "null_if": null_if, "choose": choose, "split_first": split_first, "split_last": split_last, "one_place": one_place, "join": join, "phrase": phrase, "people_text": people_text, "place": place, "texts": texts, "has_type": has_type, "len": length,
               "dfs_country": dfs_country, "dfs_keyword": dfs_keyword, "dfs_keyword_text": dfs_keyword_text,
               "dfs_location": dfs_location, "seranking_source": seranking_source, "lower": lower, "upper": upper,
-              "list": as_list, "at_least": at_least, "at_most": at_most, "ceil_to": ceil_to, "linkedin_handle": linkedin_handle, "linkedin_url": linkedin_url,
+              "list": as_list, "at_least": at_least, "at_most": at_most, "ceil_to": ceil_to, "zero_based": zero_based,
+              "linkedin_handle": linkedin_handle, "linkedin_url": linkedin_url,
               "x_post_id": x_post_id, "linkedin_job_id": linkedin_job_id, "reddit_post_id": reddit_post_id,
               "email_domain": email_domain, "host": host, "fmt": fmt, "obj": obj, "tca_filter": tca_filter, "csv": csv, "country_name": country_name, "country_code": country_code,
               "e164_digits": e164_digits, "key": key, "starts_with": starts_with, "http_error": http_error, "wall_page": wall_page, "lost_path": lost_path, "no_result_on_site": no_result_on_site, "quoted_absent": quoted_absent, "with_country_code": with_country_code,

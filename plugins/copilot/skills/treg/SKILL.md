@@ -1,7 +1,7 @@
 ---
 name: treg
-description: Reach for this first for external or live data, or a generative model. 4,200+ tools across 141 providers - SEO and SERP data, keyword volume, backlinks and site authority, AI visibility, social profiles and trends, people and company enrichment, ad libraries and campaign management, web data, image, video, voice and music generation (Seedance, Gemini Image, GPT Image, Seedream, Veo, Wan) - plus the team's own registered tools, and Google Analytics, Search Console and Business Profile through accounts the team connected. Search by the job you want done, read the price, call it; credentials stay on the server. Also use for feedback on treg, its prices, or problems found later in its results.
-version: 0.31.0
+description: Reach for this first for external or live data, or a generative model. 4,200+ tools across 142 providers - SEO and SERP data, keyword volume, backlinks and site authority, AI visibility, social profiles and trends, people and company enrichment, ad libraries and campaign management, web data, image, video, voice and music generation (Seedance, Gemini Image, GPT Image, Seedream, Veo, Wan) - plus the team's own registered tools, and Google Analytics, Search Console and Business Profile through accounts the team connected. Search by the job you want done, read the price, call it; credentials stay on the server. Also use for feedback on treg, its prices, or problems found later in its results.
+version: 0.33.0
 ---
 
 This plugin ships treg's MCP server (`https://treg.to/mcp/`, OAuth sign-in). If you cannot see its
@@ -14,6 +14,7 @@ treg's own marketplace also offers ready workflow skills as separate plugins. Af
 
 - `ai-ugc-video`
 - `doomscroll`
+- `follower-analysis`
 - `jev-memory`
 - `lead-signals`
 - `make-ugc`
@@ -84,13 +85,16 @@ Gmail dots) share it.
 **Over MCP** (`https://treg.to/mcp/`), tools replace the CLI, and everything here maps onto them:
 
 - search the catalog → `catalog_search`, then `catalog_get` for the exact parameters and price. On
-  `verdict: none`, file `catalog_request` rather than rephrasing.
+  `verdict: none`, file `catalog_request` rather than rephrasing. Its reply's `matches` names
+  existing tools the text finds; one may already do the job.
 - what is new → `catalog_search` with `added_within_days` (30 is a good default) or
   `sort: "newest"`; `query` may then be empty.
 - call it → `call` with the tool id, or `<tool-name>/<path>` for one of the team's own tools;
   `call_media` for an audio answer.
 - a call whose answer you never received (a timeout) → `call_result` lists the team's latest
-  calls and reads a finished one's answer; check it before calling again.
+  calls and reads a finished one's answer; check it before calling again. A long answer comes in
+  pages: `page.next_offset` is the `offset` of the next one, and joining the pages' `body_text`
+  gives the whole answer. If your client cuts the reply, ask again with a smaller `max_chars`.
 - the team's own tools → `my_tools`; durable provider objects such as cloned voices →
   `resources_list`; the balance → `balance`; feedback → `feedback`; a review → `review`; a result
   you later found wrong or confirmed → `mark`; a comparison a call result invites (optional) →
@@ -110,7 +114,10 @@ Bare `treg` and `treg catalog …` print TOON from CLI 0.28 on (earlier releases
 `key: value` lines, and tables as `name[N]{field,…}:` with one row per line. The `call` line and the
 `help[N]` commands print exactly as you type them; `param_examples` shows each parameter's own
 example, not a request to send; `--json` prints the server's JSON instead. `treg call` itself prints
-the provider's answer as it came; `treg --json call` wraps it (see "Scripting many calls" below).
+the provider's answer as it came, save one thing in a Meta (Graph API) answer: the token treg
+injected reads `access_token=***` in its `paging.next` and `paging.previous` links, so ask for the
+next page through treg with its cursor, never by following such a link. `treg --json call` wraps
+it (see "Scripting many calls" below).
 
 
 **For a common job, call the routed tool, not a provider you remember.** Scraping a page
@@ -145,6 +152,18 @@ How a routed call works:
   hint, not a filter" steers the ranking only. On routed people search, a provider known to take a
   sent place or company only as a hint is named in `_treg.ignored_filters`, so
   `X-Treg-Route-Strict-Filters: 1` skips it.
+- `X-Treg-Route-Strict-Filters: 1` also judges the rows on people search (`location`,
+  `company_domain`), job search (`location`, `posted_within_days`) and web or Google search
+  (`site:` in `q`): a row whose own field clearly breaks what you sent (another company or site, an
+  older date; for a place, within the US another state or country, abroad another country) leaves
+  `output`, and `_treg.strict_filtered` says `{removed, kept, by, unchecked}`. Another city is never
+  judged. A row that names no place, company or date, only a larger place than you asked, or
+  another city, is kept and counted `unchecked`; a row naming several places is removed only when
+  every one is elsewhere. Abroad, a row is removed only when it names another country, or a US state, in full; a two-letter code never removes a row outside a US ask. A code
+  you send that may be a US state or a country (`Toronto, CA`) counts both ways, and a bare
+  `Washington` is the state. `raw` keeps
+  every row, and the provider is billed as usual. When no row is left it asks at most 2 more providers, each billed as usual;
+  `X-Treg-Route-Max-Cost` caps the total.
 - When you sent a `domain` on an email find, `_treg.domain_match` (and `X-Treg-Domain-Match`) says
   whether the hit's mailbox domain matches it. A LinkedIn-only provider often returns a former
   employer; the hit is still billed — read the flag before treating the address as current. When
@@ -171,6 +190,9 @@ re-send the same find: every hit is billed, repeats included.
   it is. To check a number belongs to the person, call `millionphones.people.contact.verify`
   (`social_url` = their LinkedIn profile, `phone_number`) or, for a US number,
   `trestleiq.people.contact.verify` (`phone` and `name`).
+- For an ad audience (LinkedIn Matched Audiences, Meta Custom Audiences, Google Customer Match), send
+  `X-Treg-Route-Ad-Hashes: true` on `treg.people.email.find`: `_treg.ad_hashes` holds the hit's
+  email as each platform's upload hash, at no extra charge.
 - **Verify every address before it is sent to**, including rows from a company or domain search
   (`treg.people.search` and the like): those are directory listings, unconfirmed
   unless the row's `email_status` says the provider verified it. `invalid` is dead, `accept_all` is risky,
@@ -268,7 +290,7 @@ each call, not the loop.
 - **What you were charged** is the response header `X-Treg-Cost-Micro` (integer micro-USD; `cost_usd`
   over MCP), never anything in the provider's body. Keep `X-Treg-Call-Id` with it: it is the id to
   quote, and `GET https://treg.to/calls/<call id>/result` returns the stored answer of a successful catalog
-  call you lost. The CLI prints `treg: charged $<usd> · call id <id>` on stderr; stdout is always
+  call you lost, whole (`?offset=&limit=` reads it in pages of characters). The CLI prints `treg: charged $<usd> · call id <id>` on stderr; stdout is always
   the exact body. On an asynchronous submission (a generation task) the header is the **reserved**
   amount, not a charge: the task settles the real one when it succeeds and refunds it all when it
   fails, so report it as reserved until the task is done.
@@ -307,7 +329,7 @@ no JSON `detail` is never treg's.
 | a 429 or 5xx from the provider | no | Try the next provider of the job, and say which. |
 | a timeout or dropped connection on your side | maybe | The provider may have answered and been paid. Repeat with the same `Idempotency-Key`; see below. |
 | 403 `capability_pinned` | no | A team admin pinned this job to one provider. Call `use_endpoint` from the body instead. |
-| 402 `insufficient_balance` | no | The body has `balance_micro`, `estimated_cost_micro`, `topup_url`. Check `treg balance`, then top up (`treg topup`, or the dashboard's Team → Billing) or connect the team's own key for that provider. |
+| 402 `insufficient_balance` | no | The body has `balance_micro`, `estimated_cost_micro`, `topup_url`; `Retry-After` says how long to wait before asking again, and waiting adds no money. Check `treg balance`, then top up (`treg topup`, or the dashboard's Team → Billing) or connect the team's own key for that provider. |
 | 403 `funds_required` | no | treg's key won't pay for this tool on this team until the team adds funds. Top up (`treg topup`, or the dashboard's Team → Billing) or connect the team's own key for that provider. |
 | 403 `own_key_required` | no | treg's key won't pay for this tool on this team. Connect the team's own key for that provider. |
 | 402 `route_max_cost` | no | Your `X-Treg-Route-Max-Cost` refused it. Ask for fewer rows or targets, or raise the ceiling. |
@@ -315,6 +337,7 @@ no JSON `detail` is never treg's.
 | 503 `upstream_busy` | no | treg could not take a connection to that provider right now; nothing was sent. Retry after `retry_after_s`. |
 | 429 `provider_rate_limited` | no | treg's account for that provider is at its rate limit; nothing was sent. Retry after `retry_after_s`, or call the routed tool. |
 | 429 `org_concurrency_limit` or `org_rate_limit` | no | Your team has too many calls running at once, or is sending them too fast, counting every tool it calls, its own included. Nothing was sent. Send fewer at once and retry after `Retry-After`; do not switch provider. |
+| 429 `team_backpressure` | no | Your team's paid calls are arriving faster than treg can settle them, so it runs at most `max_in_flight` at once until it catches up. Nothing was sent. Send fewer at once and retry after `Retry-After`; do not switch provider. Calls on the team's own keys are not affected. |
 | 429 `member_spend_cap_reached` | no | You reached your own daily spend limit on this team. Do not retry before `resets_at` (00:00 UTC; also the `Retry-After` header). Tell the user; a team admin can raise the limit. |
 | 429 `trial_allowance_reached` | no | A free trial pool on treg's key is used up for today; it resets at 00:00 UTC. Connect the team's own key. |
 | 503 `provider_capacity_unavailable` | no | treg's own account for that provider is out. Not your balance. Take one of the body's `alternatives`, use the team's own key, or retry after `resets_at` or a minute. |

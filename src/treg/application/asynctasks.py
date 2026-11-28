@@ -29,6 +29,7 @@ from ..models import AsyncResourceRecord, AsyncTaskRecord, CallTask, Hold, Org, 
 from ..timeutil import utcnow_naive
 from . import call_events as call_event_app
 from .call import cost as call_cost, keyslots
+from .call.evidence import AnswerMask, platform_answer_mask
 from .call.resolve import _host_of
 from .call.types import ResolutionFailed, UpstreamRequest
 
@@ -232,14 +233,15 @@ async def observe_owned_poll(call_id: str, status_code: int, body: bytes, *,
 
 
 async def views_for(
-    org_id: int, call_ids: list[str], *, pinned_tags: dict | None = None,
+    org_id: int, call_ids: list[str], *, pinned_tags: dict | None = None, answers: bool = True,
 ) -> dict[str, dict]:
     """The task's own account of each metered async call, keyed by call id, for activity displays.
 
     The audit row froze the reserve as "charged" at submission; this is where the display learns
     what actually happened (settled amount, refund, 24-hour fallback) and what the caller bought.
     Terminal JSON comes from the archive; a settled task whose recording was shed still reports its
-    money truthfully, only without a link.
+    money truthfully, only without a link. With `answers=False` only money and status are read: no
+    terminal answer is loaded or masked, and no link is derived.
     """
     if not call_ids:
         return {}
@@ -252,8 +254,10 @@ async def views_for(
     if not rows:
         return {}
     documents = await archive.load_terminal_responses(
-        [(row.call_id, row.endpoint_id) for row in rows if row.status == asynctasks.SETTLED])
+        [(row.call_id, row.endpoint_id) for row in rows
+         if row.status == asynctasks.SETTLED]) if answers else {}
     views: dict[str, dict] = {}
+    masks: dict[str, AnswerMask] = {}
     for row in rows:
         view = {
             "status": row.status, "task_id": row.task_id,
@@ -266,6 +270,9 @@ async def views_for(
         }
         body = documents.get(row.call_id)
         if body is not None:
+            if row.provider not in masks:
+                masks[row.provider] = platform_answer_mask(row.provider)
+            body = masks[row.provider].answer(body)
             try:
                 found = asynctasks.artifact(row.descriptor, json.loads(body))
             except ValueError:
@@ -312,10 +319,10 @@ async def _claim_due(call_id: str, now) -> int | None:
         return attempt
 
 
-def _poll_target(row: AsyncTaskRecord) -> tuple[str, str, list[tuple[str, str]]]:
+def _poll_target(row: AsyncTaskRecord) -> tuple[str, str, list[tuple[str, str]], bytes]:
     poll = row.descriptor.get("poll") or {}
     if row.poll_url:
-        return "GET", row.poll_url, []
+        return "GET", row.poll_url, [], b""
     endpoint_id = poll.get("endpoint")
     endpoint = catalog_store.load().by_id.get(endpoint_id)
     if not endpoint:
@@ -326,6 +333,9 @@ def _poll_target(row: AsyncTaskRecord) -> tuple[str, str, list[tuple[str, str]]]
     url = provider.base_url.rstrip("/") + "/" + endpoint["path"].lstrip("/")
     query: list[tuple[str, str]] = []
     param = poll.get("param") or {}
+    if param.get("in") == "body":
+        _, document = asynctasks.poll_inputs(param, row.task_id)
+        return str(endpoint.get("method") or "POST"), url, query, json.dumps(document).encode()
     if param:
         # The declared location decides, never a coincidental placeholder; a path value is
         # percent-encoded so a provider-controlled task id cannot add URL syntax.
@@ -337,14 +347,14 @@ def _poll_target(row: AsyncTaskRecord) -> tuple[str, str, list[tuple[str, str]]]
             url = url.replace(marker, quote(value, safe=""))
         else:
             query.append((name, value))
-    return str(endpoint.get("method") or "GET"), url, query
+    return str(endpoint.get("method") or "GET"), url, query, b""
 
 
 async def _poll(row: AsyncTaskRecord, client: httpx.AsyncClient) -> tuple[int, bytes]:
     provider = oauth_providers.get(row.provider)
     if provider is None:
         raise RuntimeError(f"provider {row.provider!r} is not registered")
-    method, url, query = _poll_target(row)
+    method, url, query, body = _poll_target(row)
     # The query travels as `query_items`: the relay composes the upstream URL from those (it
     # forwards a URL's own query string nowhere), so a query-parameter poll (MiniMax v1
     # `?task_id=`) appended to the URL would reach the provider empty.
@@ -355,12 +365,14 @@ async def _poll(row: AsyncTaskRecord, client: httpx.AsyncClient) -> tuple[int, b
                 base_url=provider.base_url, host=_host_of(provider.base_url),
                 bindings=oauth_providers.platform_bindings(provider, account))
 
-    async def empty():
-        if False:
-            yield b""
+    async def payload():
+        if body:
+            yield body
 
-    request = UpstreamRequest(method=method, raw_headers=(), query_items=tuple(query),
-                              body_stream=empty, has_body=False)
+    headers = ((b"content-type", b"application/json"),
+               (b"content-length", str(len(body)).encode())) if body else ()
+    request = UpstreamRequest(method=method, raw_headers=headers, query_items=tuple(query),
+                              body_stream=payload, has_body=bool(body))
     response = await relay(request, url, tool, [], client, force_identity=True)
     try:
         chunks, size = [], 0
@@ -525,6 +537,16 @@ def _terminal_event(snapshot: AsyncTaskRecord, result: str, outcome: str, *,
         async_outcome="closed_hold" if result == "closed_hold" else outcome)
 
 
+def _record_terminal(snapshot: AsyncTaskRecord, settled: dict, *,
+                     hit: bool | None = None, verdict: str | None = None) -> None:
+    """Copy what the task closed at onto its submission's call record. `settled` is filled only by
+    the transition out of PENDING, so each task writes it once."""
+    if settled.get("micro") is None and hit is None:
+        return
+    audit.record_async_call_terminal(snapshot.call_id, snapshot.endpoint_id, snapshot.org_id,
+                                     hit=hit, verdict=verdict, charged_micro=settled.get("micro"))
+
+
 async def _answers_allowed(db, org_id: int | None) -> bool:
     """Whether the task owner's events may carry answer columns (no archive opt-out). Read on a
     session the caller already holds, before any network I/O, and only when events are on."""
@@ -589,14 +611,15 @@ async def _finish_terminal(snapshot: AsyncTaskRecord, outcome: str, document: ob
                     hit=terminal_hit if result == expected else None,
                     verdict_word=terminal_verdict if result == expected else None,
                     answers_allowed=answers_allowed, charged_micro=settled.get("micro"))
+    _record_terminal(snapshot, settled,
+                     hit=terminal_hit if result == expected else None,
+                     verdict=terminal_verdict if result == expected else None)
     if result == expected:
-        if terminal_hit is not None:
-            audit.record_async_call_hit(
-                snapshot.call_id, snapshot.endpoint_id, snapshot.org_id, terminal_hit,
-                verdict=terminal_verdict)
         # Only the winning finalizer records evidence; a late poll cannot replace the result
         # whose usage was charged. Archive failure cannot undo the committed money transaction.
         try:
+            if (catalog_store.load().by_id.get(snapshot.endpoint_id) or {}).get("echoes_credential"):
+                body = platform_answer_mask(snapshot.provider).answer(body)
             await archive.store_terminal_response(
                 snapshot.call_id, snapshot.provider, snapshot.endpoint_id, status_code, body)
         except Exception:
@@ -622,6 +645,7 @@ async def _process(call_id: str, client: httpx.AsyncClient, attempt: int, *,
             snapshot.org_id, "release", call_id, "timed_out", None, now, expected_attempt=attempt,
             settled=settled, deadline=deadline)
         _terminal_event(snapshot, result, "timed_out", charged_micro=settled.get("micro"))
+        _record_terminal(snapshot, settled)
         return result
     try:
         async with asyncio.timeout(POLL_TIMEOUT_S):
@@ -662,6 +686,7 @@ async def _process(call_id: str, client: httpx.AsyncClient, attempt: int, *,
                                        None, utcnow_naive(), expected_attempt=attempt,
                                        settled=settled, deadline=deadline)
         _terminal_event(snapshot, result, "account_retired", charged_micro=settled.get("micro"))
+        _record_terminal(snapshot, settled)
         return result
     except money_admission.AdmissionRefused:
         raise

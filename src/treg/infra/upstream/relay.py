@@ -33,6 +33,12 @@ Faithfulness contract — it alters ONLY these, everything else is relayed verba
      split usage, errors and cost per customer on treg's one account without learning who the
      customer is, and two providers' codes for one team do not match. Any value the caller sent
      under that name is replaced. A team's own key relays the caller's headers verbatim.
+  7. `Accept-Encoding`, a transport header: `identity` when the caller sent none or the application
+     parses the answer (`force_identity`); and, on a team's own credential to a catalog row marked
+     `echoes_credential` that the archive does not record, only the codings the application can
+     decode (`readable_encodings_only`), since it reads that answer whole to mask the credential
+     the provider writes into it: a caller offering br gets gzip there, or no compression from a
+     provider that offers only br. Every other request carries the caller's value as sent.
 
 Except for that explicit JSON-binding contract, it never buffers the body (rule 5: stream, don't
 duplicate) and uses the shared long-lived httpx client (rule 1: keepalive). Secrets are passed
@@ -56,6 +62,7 @@ from ...application.call.types import GatewayFailed, UpstreamRequest, UpstreamRe
 from ...config import TREG_USER_AGENT, get_settings
 from ...models import Secret, Tool
 from . import injectors, pathsegment
+from .ssrf import AddressLookupTimedOut
 
 # Connection-level headers that belong to a single hop and must NOT be forwarded as-is.
 _HOP_BY_HOP = frozenset(
@@ -104,6 +111,23 @@ def identify_as_treg(raw_headers: tuple[tuple[bytes, bytes], ...]) -> tuple[tupl
     treg's own (see the module docstring for the providers that blocked library defaults)."""
     kept = tuple((k, v) for k, v in raw_headers if k.lower() != b"user-agent")
     return kept + ((b"user-agent", TREG_USER_AGENT.encode()),)
+
+
+def readable_encodings_only(
+    raw_headers: tuple[tuple[bytes, bytes], ...], codings: frozenset[str],
+) -> tuple[tuple[bytes, bytes], ...]:
+    """Rewrite 7 of the faithfulness contract: the caller's `Accept-Encoding` keeping only `codings`
+    and `identity` (`identity` when none is left), for a request whose answer the call application
+    reads whole to search: a coding it cannot decode would hide what it must search. No header is
+    left as none: the relay then asks for identity."""
+    values = [v.decode("latin-1") for k, v in raw_headers if k.lower() == b"accept-encoding"]
+    if not values:
+        return raw_headers
+    allowed = codings | {"identity"}
+    kept = [part.strip() for value in values for part in value.split(",")
+            if part.strip() and part.split(";", 1)[0].strip().lower() in allowed]
+    rest = tuple((k, v) for k, v in raw_headers if k.lower() != b"accept-encoding")
+    return rest + ((b"accept-encoding", (", ".join(kept) or "identity").encode("latin-1")),)
 
 
 def shared_client_code(secret: str, provider: str, org_id: int) -> str:
@@ -298,11 +322,17 @@ async def relay(
     # Call-time SSRF guard: resolve the upstream host NOW and refuse an internal target — defeats DNS
     # rebinding (base_url was public at registration, its DNS now points at 169.254.169.254 / localhost).
     from . import health
-    if get_settings().proxy_ssrf_check and not await health.host_is_public_async(
-            upstream_req.url.host, health.host_is_public):
-        raise GatewayFailed(
-            "ssrf_refused", status_code=502,
-            detail="upstream host resolves to a non-public address")
+    if get_settings().proxy_ssrf_check:
+        try:
+            public = await health.host_is_public_async(upstream_req.url.host, health.host_is_public)
+        except AddressLookupTimedOut:
+            raise GatewayFailed(
+                "ssrf_refused", status_code=502,
+                detail="upstream host address lookup timed out") from None
+        if not public:
+            raise GatewayFailed(
+                "ssrf_refused", status_code=502,
+                detail="upstream host resolves to a non-public address")
     if before_outbound is not None:
         await before_outbound()
     if (on_send := ON_SEND.get()) is not None:

@@ -89,7 +89,10 @@ tool is `GET {BASE}/call/<id>?key=value` with the header `X-Treg-Token: <token>`
 tools is `{BASE}/call/<tool-name>/<path>`, or its upstream URL behind the prefix:
 `{BASE}/call/https://api.stripe.com/v1/charges`. A team token (an agent token or a dashboard API
 key) carries its team; with a personal sign-in token, also send `X-Treg-Org: <team-slug>`. Method,
-path, query and body reach the provider unchanged, and its answer comes back verbatim.
+path, query and body reach the provider unchanged, and its answer comes back verbatim, save one
+thing in a Meta (Graph API) answer: the token treg injected reads `access_token=***` in its
+`paging.next` and `paging.previous` links, so ask for the next page through treg with its cursor,
+never by following such a link.
 A client already written against a provider can keep its paths: `{BASE}/call/<provider>/<path>`,
 with the path relative to the provider's base URL (`{BASE}/call/dataforseo/serp/google/organic/live/advanced`
 for `https://api.dataforseo.com/v3/serp/...`), runs the catalog tool on that path exactly as its id
@@ -99,6 +102,9 @@ The MCP server at `{BASE}/mcp/` takes a bearer header or OAuth, and offers `cata
 `catalog_get`, `call`, `call_media` (audio), `call_result`, `resources_list`, `balance`,
 `my_tools`, `catalog_request`, `feedback`, `review`, `mark` and `compare` (two anonymous answers
 to an input you sent, when a call result invites a comparison; optional).
+`call_result` reads a call whose answer you never received (`GET {BASE}/calls/<call id>/result`
+over HTTP, whole). Over MCP a long answer comes in pages of `max_chars` characters; `page.next_offset`
+is the `offset` of the next page, and the pages' `body_text` join into the whole answer.
 <!--hub-->
 Publishing a hub tool adds `hub_create`, `hub_update` and `hub_mine`.
 <!--/hub-->
@@ -110,7 +116,8 @@ Publishing a hub tool adds `hub_create`, `hub_update` and `hub_mine`.
   folder, and later sessions load it on their own.
 - Search by the job you want done. When the catalog has no tool for it (`verdict: none`), file the
   need with `treg catalog request "<what you need>"` (MCP `catalog_request`) instead of rephrasing
-  the search: requests steer what gets added next.
+  the search: requests steer what gets added next. The reply's `matches` lists existing tools the
+  request's text finds; check them with `catalog_get`, since one may already do the job.
 <!--routed-->
 - For a common job (scraping a page, web search, Google results, finding or verifying an email, a
   social profile), call the routed `treg.<capability>` tool rather than a provider you remember:
@@ -118,9 +125,13 @@ Publishing a hub tool adds `hub_create`, `hub_update` and `hub_mine`.
   returns. Name a provider only when you need fields only it has. To page a list, send
   `output.next_cursor` back as `cursor` with the same body; `_treg.paging` says when to ask another provider.
 - Provider search filters and operators (a place, a domain list, `site:`, quoted phrases) are
-  best-effort: check the rows against your filters, and on routed people search send
-  `X-Treg-Route-Strict-Filters: 1` to skip providers known to take a sent place or company only as a
-  hint.
+  best-effort: check the rows against your filters, or send `X-Treg-Route-Strict-Filters: 1`. It
+  skips providers known to take a sent filter only as a hint, and on people search (place, company
+  domain), job search (place, posted within days) and web or Google search (`site:`) it removes from
+  `output` the rows whose own field clearly breaks the filter (another state or country, never another city; a row
+  naming only a larger place than asked is kept, unchecked. Abroad, a row is removed only when it names another country, or a US state, in full; a two-letter code never removes a row outside a US ask.): `_treg.strict_filtered` counts them,
+  `raw` keeps them, and the provider is billed as usual. When no row is left it asks at most 2 more
+  providers, each billed as usual; `X-Treg-Route-Max-Cost` caps the total.
 <!--/routed-->
 - Choosing a provider yourself: first the one whose inputs match what you hold, then measured
   reliability, then price. `treg catalog get <id>` compares the job's ten most reliable and cheapest
@@ -141,6 +152,8 @@ Publishing a hub tool adds `hub_create`, `hub_update` and `hub_mine`.
   profile (`social_url`) and the `phone_number`. On an email find where you sent a domain, also read `_treg.domain_match` —
   a LinkedIn-only provider often returns a former employer. `X-Treg-Route-Domain-Match: strict`
   keeps asking providers past an off-domain hit, each attempt at its own price.
+- For an ad audience upload, `X-Treg-Route-Ad-Hashes: true` on `treg.people.email.find` adds the
+  hit's email as LinkedIn, Meta and Google hashes in `_treg.ad_hashes`, at no extra charge.
 - Never ask for a provider key or paste one into code. Register it with treg once, and every agent
   on the team calls it without holding it.
 - When an answer or an error names a next step (a hint, `_treg.advice`, an error body), follow it.

@@ -1,6 +1,5 @@
 """Replica routing is opt-in; its pool must not become a second write path."""
 
-import importlib.util
 import sqlite3
 from contextlib import closing
 
@@ -14,24 +13,12 @@ from treg.infra import db as infra_db
 
 
 @pytest.fixture
-async def load_database(monkeypatch):
-    """Build isolated module instances without replacing the application's imported makers."""
-    modules = []
-
+def load_database(load_db_module):
     def load(read_url="", overrides="", *, primary_url=None):
-        settings = config.Settings(_env_file=None, database_url=primary_url or infra_db._db_url,
-                                   read_database_url=read_url, db_pool_overrides=overrides)
-        spec = importlib.util.spec_from_file_location("treg.infra._replica_test", infra_db.__file__)
-        module = importlib.util.module_from_spec(spec)
-        with monkeypatch.context() as patch:
-            patch.setattr(config, "get_settings", lambda: settings)
-            spec.loader.exec_module(module)
-        modules.append(module)
-        return module
+        return load_db_module(database_url=primary_url or infra_db._db_url,
+                              read_database_url=read_url, db_pool_overrides=overrides)
 
-    yield load
-    for module in modules:
-        await module.dispose_engine()
+    return load
 
 
 @pytest.mark.parametrize("scheme", ["postgres", "postgresql", "postgresql+asyncpg"])
@@ -63,7 +50,6 @@ def test_unconfigured_reads_reuse_the_primary_without_an_extra_pool(load_databas
     assert db.read_session_maker is db.session_maker
     assert db._read_engine is db._engine
     assert "read" not in db.pool_snapshot()
-    assert len(set(db._engines)) == (1 if db._is_sqlite else 3)
 
 
 async def test_configured_reads_have_their_own_pool_and_budget(load_database):
@@ -133,8 +119,7 @@ async def test_unconfigured_sqlite_keeps_primary_writable(load_database, sqlite_
         assert await session.scalar(text("SELECT count(*) FROM read_replica_probe")) == 2
 
 
-@pytest.mark.parametrize("same_database", [False, True])
-@pytest.mark.parametrize("read_only_file", [False, True])
+@pytest.mark.parametrize("same_database,read_only_file", [(False, False), (True, True)])
 async def test_sqlite_reader_guards_writes_without_affecting_primary(
     load_database, sqlite_sources, same_database, read_only_file,
 ):

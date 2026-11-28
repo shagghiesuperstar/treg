@@ -22,13 +22,14 @@ from typing import cast
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import QueryableAttribute, defer
 from sqlmodel import select
 
 from . import archive, crypto, localrun, oauth_providers, ratestore
 from .application import asynctasks as async_task_app
+from .application import catalog_search as search_app
 from .application.call import service as call_service
 from .caller_metadata import _client_of
 from .config import get_settings
@@ -48,7 +49,7 @@ from .domain.identity.access import (
 )
 from .domain.identity import api_keys as managed_keys
 from .domain.identity import session as identity_session
-from .models import (CallRecord, CapabilityPin, LedgerEntry, Membership, Org, RunRecord, Secret,
+from .models import (CallCharge, CallRecord, CapabilityPin, LedgerEntry, Membership, Org, RunRecord, Secret,
                      Tool, ToolRequest, User)
 from .routers import activity as activity_routes
 from .routers import admin as admin_routes
@@ -162,6 +163,17 @@ async def _id_out_of_range(request: Request, exc: OverflowError) -> JSONResponse
     return JSONResponse({"detail": "identifier out of range"}, status_code=404)
 
 
+async def _db_id_out_of_range(request: Request, exc: DBAPIError) -> JSONResponse:
+    # asyncpg refuses a parameter past Postgres's 32-bit `integer` while binding it, and SQLAlchemy
+    # wraps that OverflowError in a DBAPIError. Any other database error stays a 500.
+    cause: BaseException | None = exc.orig
+    while cause is not None and not isinstance(cause, OverflowError):
+        cause = cause.__cause__
+    if cause is None:
+        raise exc
+    return await _id_out_of_range(request, cause)
+
+
 _app_version_cache: tuple[float, str] | None = None  # (index.html mtime, content hash)
 
 
@@ -265,7 +277,7 @@ async def create_tool_request(
     """Open: file a "the catalog doesn't have X" report. No auth on purpose — the filer is most
     often an agent that just got zero search results and holds no token, and a signup wall here
     costs exactly the demand signal the catalog team wants. Per-IP rate limiting (ratestore) is
-    the abuse valve, same shape as POST /demo/sandbox; field caps bound the row.
+    the abuse valve; field caps bound the row.
 
     Identity is attribution, never authorization: when the caller happens to be signed in (token
     or same-origin session), the row records who asked so they can be told when it lands — a
@@ -303,19 +315,28 @@ async def create_tool_request(
         user = await _user_from_session(treg_session, db)
         if user is not None:
             user_email = user.email
+    query = body.query.strip()[:300]
+    source = body.source if body.source in TOOLREQ_SOURCES else "api"
     row = ToolRequest(
         org_id=org_id,
         user_email=user_email,
         capability=capability,
-        query=body.query.strip()[:300],
+        query=query,
         note=body.note.strip()[:2000],
         contact=body.contact.strip()[:200],
-        source=body.source if body.source in TOOLREQ_SOURCES else "api",
+        source=source,
     )
     db.add(row)
     await db.commit()
-    return {"id": row.id, "status": "received",
-            "note": "logged — requests steer which provider gets keyed next"}
+    filed = row.id
+    await db.close()
+    # The Claude directory surface drops the matches (its schema is the submitted one).
+    matches = ({} if source == "claude-connector"
+               else await search_app.request_reply_off_loop(
+                   capability, query, catalog_routes._provider_display,
+                   cap_key=search_app.request_cap_key(org_id, user_email, _client_ip(request))))
+    return {"id": filed, "status": "received",
+            "note": "logged — requests steer which provider gets keyed next", **matches}
 
 
 view_routes.renders(create_tool_request)(catalog_routes.tool_request_view)
@@ -348,7 +369,6 @@ router.routes.extend(auth_routes.grants_router.routes)
 router.routes.extend(org_routes.org_entry_router.routes)
 router.routes.extend(org_routes.invite_entry_router.routes)
 router.routes.extend(onboard_routes.onboard_entry_router.routes)
-router.routes.extend(onboard_routes.sandbox_router.routes)
 router.routes.extend(onboard_routes.onboard_teammate_router.routes)
 router.routes.extend(org_routes.invite_management_router.routes)
 router.routes.extend(org_routes.member_list_router.routes)
@@ -707,11 +727,14 @@ async def list_calls(
 
 
 _ROUTED_CHILD_WINDOW = timedelta(hours=1)
+RESULT_PAGE_MAX_CHARS = 2_097_152
 
 
 @app.get("/calls/{call_id}/result")
 async def get_call_result(
     call_id: str, request: Request, caller: Caller = Depends(require_member),
+    offset: int | None = Query(None, ge=0),
+    limit: int | None = Query(None, ge=1, le=RESULT_PAGE_MAX_CHARS),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
     """What one of this team's calls asked and what came back — the archive's copy.
@@ -721,13 +744,19 @@ async def get_call_result(
 
     A 2xx answer the archive recorded has one (see docs/context/architecture/archive.md): a metered
     platform call, or an own-key call whose answer fit the size cap while recording was on. The
-    audit row keeps the identities of the provider's bytes; a metered answer is returned as its
-    caller received it: where treg removes the provider's reported charge, without it unless this
-    request sends `X-Treg-Keep-Reported-Charge: true`. Own-tool calls are
+    audit row keeps the identities of the stored bytes; an answer is returned with treg's own
+    credentials for its provider masked, and a metered one as its caller received it: where treg
+    removes the provider's reported charge, without it unless this request sends
+    `X-Treg-Keep-Reported-Charge: true`. Own-tool calls are
     relayed without being stored, a failed call never is, and the redacted failure evidence stays admin-only — `stored` is false
     with a `note` saying which. A routed call's answer is its children's: its row lists them in
     `children`, each readable here by its call ref. The request shape is the vendor-facing one
     BEFORE credential injection, so no secret can appear in it.
+
+    The answer is whole unless `offset` or `limit` asks for a page: `limit` characters of the
+    answer from `offset`, with `offset`, `total_chars` and `next_offset` (null on the last page) in
+    `response`. Pages are cut after masking, so they join back into the whole answer; past the
+    first page the request is left out.
     """
     row = (await db.execute(
         select(CallRecord)
@@ -780,12 +809,25 @@ async def get_call_result(
     if not found["stored"]:
         out["note"] = ("hash-only: the provider's licence or the size cap did not allow keeping "
                        "the bytes")
-    elif (row.cost_charged_micro is not None and 200 <= row.status_code < 300
-          and (text := (found.get("response") or {}).get("body_text")) is not None):
-        # The archive keeps the provider's bytes; a metered answer is shown as its caller got it.
-        out["response"]["body_text"] = call_service.answer_for_caller(
-            row.endpoint_id, text.encode("utf-8"), request.headers).decode("utf-8")
+    elif (text := (found.get("response") or {}).get("body_text")) is not None:
+        out["response"]["body_text"] = call_service.stored_answer_for_caller(
+            row.provider, row.endpoint_id, text.encode("utf-8"), request.headers,
+            metered=row.cost_charged_micro is not None and 200 <= row.status_code < 300,
+        ).decode("utf-8")
+    if offset is not None or limit is not None:
+        _page_result(out, offset or 0, limit or RESULT_PAGE_MAX_CHARS)
     return out
+
+
+def _page_result(out: dict, start: int, size: int) -> None:
+    response = out.get("response") or {}
+    if (text := response.get("body_text")) is None:
+        return
+    end = min(start + size, len(text))
+    response.update(body_text=text[start:end], offset=start, total_chars=len(text),
+                    next_offset=end if end < len(text) else None)
+    if start > 0:
+        out["request"] = None
 
 
 @app.get("/calls/{call_ref}")
@@ -806,10 +848,16 @@ async def get_call(
                  defer(cast(QueryableAttribute, CallRecord.error_response), raiseload=True))
         .where(CallRecord.org_id == caller.org_id, CallRecord.call_ref == call_ref,
                *pinned_tag_predicates(CallRecord.tags, caller.membership.pinned_tags)))).scalars().first()
-    if row is None and caller.membership.pinned_tags:
+    # Before the ledger: a fold commits the charge's removal with its settle entry, so a fold in
+    # between moves the call into the next read, never out of both.
+    queued = (await db.execute(select(CallCharge.call_id).where(
+        CallCharge.org_id == caller.org_id, CallCharge.call_id == call_ref,
+        *pinned_tag_predicates(CallCharge.meta["tags"], caller.membership.pinned_tags),
+    ))).scalar_one_or_none()
+    if row is None and queued is None and caller.membership.pinned_tags:
         owned = (await db.execute(select(LedgerEntry.id).where(
             LedgerEntry.org_id == caller.org_id, LedgerEntry.call_id == call_ref,
-            LedgerEntry.kind == "reserve",
+            LedgerEntry.kind.in_(("reserve", "settle")),
             *pinned_tag_predicates(LedgerEntry.meta["tags"], caller.membership.pinned_tags),
         ).limit(1))).scalar_one_or_none()
         if owned is None:
@@ -817,7 +865,7 @@ async def get_call(
     entries = (await db.execute(select(LedgerEntry).where(
         LedgerEntry.org_id == caller.org_id, LedgerEntry.call_id == call_ref)
         .order_by(LedgerEntry.created_at))).scalars().all()
-    if row is None and not entries:
+    if row is None and queued is None and not entries:
         raise HTTPException(status_code=404, detail="no call with that id")
     await db.close()
     task = (await async_task_app.views_for(
